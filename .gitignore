@@ -1,0 +1,58 @@
+# ---- Secrets and local configuration (never commit) ----------------------------------------------------
+# Real database credentials live here; the committed templates are .env.example and env.json.example.
+.env
+.env.*
+!.env.example
+env.json
+!env.json.example
+# Truststores, certificates and keys (e.g. a database provider's CA bundle)
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.pem
+*.key
+*.crt
+
+# ---- Maven ----------------------------------------------------------------------------------------------
+target/
+dependency-reduced-pom.xml
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+
+# ---- AWS SAM --------------------------------------------------------------------------------------------
+# Build output and cache; recreated by `sam build`.
+.aws-sam/
+# Local-only files for `sam local` (the template and samconfig.toml stay committed).
+samconfig.local.toml
+
+# ---- IDEs -----------------------------------------------------------------------------------------------
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+
+# ---- Claude Code (personal settings stay local) ---------------------------------------------------------
+.claude/settings.local.json
+
+# ---- Logs, JVM crash files, temp -----------------------------------------------------------------------
+*.log
+hs_err_pid*
+replay_pid*
+*.tmp
+*.swp
+*~
+
+# ---- Operating system -----------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
