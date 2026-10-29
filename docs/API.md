@@ -5,7 +5,7 @@ Two endpoints, each backed by its own Lambda:
 | Endpoint | Purpose | Lambda |
 |---|---|---|
 | [`POST /api/v1/recruiter/applications`](#1-post-apiv1recruiterapplications) | A recruiter records a job application they already made for an assigned student | RecruiterLambda |
-| [`GET /api/v1/student/applications`](#2-get-apiv1studentapplications) | A student lists the applications recorded for them on one calendar day | StudentLambda |
+| [`GET /api/v1/student/applications`](#2-get-apiv1studentapplications) | A student's dashboard: today's recorded applications plus monthly/daily/weekly progress statistics | StudentLambda |
 
 > **Status: development only.** Authentication is not implemented yet. Callers are identified by temporary
 > `X-Dev-*` headers that are **not authentication** and are accepted only when the server is started with the
@@ -22,8 +22,8 @@ Two endpoints, each backed by its own Lambda:
 | Base URL (deployed) | not deployed yet |
 | Request/response format | JSON, UTF-8. Every response from the application has `Content-Type: application/json` |
 | Identifiers | `userId`, `studentId`, `applicationId`, object ids are positive 64-bit integers, sent as JSON numbers |
-| Timestamps | ISO-8601 in UTC with a `Z` suffix, e.g. `2026-10-25T15:30:00Z` |
-| Calendar days | `YYYY-MM-DD`, interpreted in the application time zone (`America/Chicago` by default) |
+| Timestamps | ISO-8601 with the reporting-zone offset, e.g. `2026-10-29T10:30:00-05:00` (the same instant as `2026-10-29T15:30:00Z`) |
+| Calendar days | `YYYY-MM-DD` throughout responses (`date`, `asOfDate`, `month` as `YYYY-MM`, weekday `date`s), all resolved server-side in the reporting zone (`APP_TIMEZONE`, `America/Chicago` by default) — never supplied by the client |
 | Header names | case-insensitive |
 | Trailing slash | `/api/v1/student/applications/` is the same route as without the slash |
 
@@ -241,8 +241,9 @@ curl -i -X POST http://127.0.0.1:3000/api/v1/recruiter/applications \
 
 ## 2. `GET /api/v1/student/applications`
 
-Returns **every** application recorded for the student on one calendar day, newest first. The server splits them
-into pages of 20 and returns **all pages in one response**; there is no `page` parameter. Page navigation and
+The student dashboard in one call. Returns **today's** applications (newest first, in pages of 20, all pages in one
+response) and **statistics** (monthly progress, today's progress, Monday-to-Friday weekly activity). The backend
+always reports the current date; there is **no `date` parameter and no pagination parameters**. Page navigation and
 caching are the client's job.
 
 ### Request
@@ -257,19 +258,17 @@ No body. `Content-Type` is not needed.
 
 **Query parameters**
 
-| Parameter | Required | Format | Description |
-|---|---|---|---|
-| `date` | no | `YYYY-MM-DD`, year 1970 to 9998 | the calendar day to list, in the application time zone. If omitted, **today** in that zone. An empty value (`?date=`) is an error, not "omitted" |
+None. The parameters `date`, `startDate`, `endDate`, `month`, `week`, `page` and `size` are **rejected with 400**
+(matched case-insensitively) so a client is never silently given a different period than it expects. Any other
+parameter is ignored.
 
-Other query parameters are ignored.
+**Reporting date and periods.** "Today", the current month, and Monday-to-Friday of the current week are calendar
+ranges in the reporting zone (`APP_TIMEZONE`, default `America/Chicago`), resolved once per request from the server
+clock. Days are 24 hours except at daylight saving (2026-11-01 is 25 hours, 2026-03-08 is 23). An application
+belongs to the day/week/month it was recorded in *in that zone*, so one recorded at 8 PM Chicago time on Oct 29
+(01:00 UTC Oct 30) counts under Oct 29.
 
-**How the day is computed.** `date=2026-10-25` means 00:00:00 to 24:00:00 on that day in `America/Chicago`
-(configurable on the server). Days are 24 hours long except at daylight saving: 2026-11-01 is 25 hours and
-2026-03-08 is 23. An application falls on the day in which it was recorded *in that zone*, so one recorded at
-8 PM Chicago time on Oct 25 (01:00 UTC on Oct 26) is listed under `2026-10-25`.
-
-**Order.** Newest first by `appliedAt`; applications with the same timestamp are ordered by `applicationId`,
-highest first. This order holds across pages: reading page 1, then 2, and so on, gives the full day in order.
+**Order.** Newest first by `appliedAt`; ties broken by `applicationId`, highest first. The order holds across pages.
 
 ### Responses
 
@@ -280,33 +279,50 @@ highest first. This order holds across pages: reading page 1, then 2, and so on,
   "success": true,
   "data": {
     "studentId": 1000000002,
-    "date": "2026-10-25",
-    "totalApplications": 21,
+    "date": "2026-10-29",
+    "totalApplications": 35,
     "pageSize": 20,
     "totalPages": 2,
     "pages": {
       "1": [
         {
-          "applicationId": 1000000025,
+          "applicationId": 1000000035,
           "jobTitle": "Senior Java Backend Developer",
           "companyName": "Amazon",
           "jobLocation": "Austin, TX",
-          "jobLink": "https://www.amazon.jobs/en/jobs/1234567",
+          "jobLink": "https://example.com/jobs/35",
           "jobSource": "Amazon Careers",
-          "appliedAt": "2026-10-25T15:30:00Z"
+          "appliedAt": "2026-10-29T10:30:00-05:00"
         }
       ],
       "2": [
         {
-          "applicationId": 1000000004,
+          "applicationId": 1000000015,
           "jobTitle": "Software Engineer",
           "companyName": "Microsoft",
           "jobLocation": "Houston, TX",
-          "jobLink": "https://example.com/jobs/30",
+          "jobLink": "https://example.com/jobs/15",
           "jobSource": "LinkedIn",
-          "appliedAt": "2026-10-25T12:00:00Z"
+          "appliedAt": "2026-10-29T09:15:00-05:00"
         }
       ]
+    },
+    "statistics": {
+      "asOfDate": "2026-10-29",
+      "timezone": "America/Chicago",
+      "monthlyProgress": { "month": "2026-10", "applied": 820, "target": 1100, "remaining": 280, "percentage": 75 },
+      "todayProgress":   { "date": "2026-10-29", "applied": 35, "target": 50, "remaining": 15, "percentage": 70 },
+      "weeklyActivity":  {
+        "weekStartDate": "2026-10-26",
+        "targetPerWeekday": 50,
+        "days": [
+          { "day": "Mon", "date": "2026-10-26", "applications": 50 },
+          { "day": "Tue", "date": "2026-10-27", "applications": 44 },
+          { "day": "Wed", "date": "2026-10-28", "applications": 50 },
+          { "day": "Thu", "date": "2026-10-29", "applications": 38 },
+          { "day": "Fri", "date": "2026-10-30", "applications": 0 }
+        ]
+      }
     }
   }
 }
@@ -316,37 +332,48 @@ highest first. This order holds across pages: reading page 1, then 2, and so on,
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | boolean | `true` |
 | `data.studentId` | integer | the student from the header |
-| `data.date` | string | the day that was queried (the resolved day when `date` was omitted) |
-| `data.totalApplications` | integer | number of applications on that day, across all pages |
+| `data.date` | string | **today** in the reporting zone, `YYYY-MM-DD` |
+| `data.totalApplications` | integer | **today's** application count, across all pages (equals `statistics.todayProgress.applied`) |
 | `data.pageSize` | integer | always `20` |
-| `data.totalPages` | integer | number of pages; `0` when there are none |
-| `data.pages` | object | keys are page numbers as **strings** (`"1"`, `"2"`, ...), starting at 1, with no gaps and no empty pages. Each value is an array of applications |
+| `data.totalPages` | integer | number of pages; `0` when there are none today |
+| `data.pages` | object | keys are page numbers as **strings** (`"1"`, `"2"`, ...), from 1, no gaps, no empty pages |
 | `...[].applicationId` | integer | |
 | `...[].jobTitle`, `companyName`, `jobLocation`, `jobLink`, `jobSource` | string | as recorded |
-| `...[].appliedAt` | string | UTC instant, `YYYY-MM-DDTHH:MM:SSZ` |
+| `...[].appliedAt` | string | ISO-8601 with the reporting-zone offset, e.g. `2026-10-29T10:30:00-05:00` |
+| `statistics.asOfDate` | string | the reporting date, `YYYY-MM-DD` |
+| `statistics.timezone` | string | reporting zone id, e.g. `America/Chicago` |
+| `statistics.monthlyProgress` | object | `month` (`YYYY-MM`), `applied`, `target` (weekdays in month * daily target), `remaining` (`max(target-applied,0)`), `percentage` (`round(applied/target*100)`, not capped) |
+| `statistics.todayProgress` | object | `date`, `applied`, `target` (daily target, default 50), `remaining`, `percentage` (not capped) |
+| `statistics.weeklyActivity` | object | `weekStartDate` (Monday), `targetPerWeekday`, and `days`: exactly five Mon-Fri entries, each `{ day, date, applications }` |
 
-Page sizes: 10 applications give one page of 10; 20 give one page of 20; 21 give pages of 20 and 1; 35 give 20
-and 15; 50 give 20, 20 and 10.
+Page sizes: 10 give one page of 10; 20 give one page of 20; 21 give 20 and 1; 35 give 20 and 15; 50 give 20, 20, 10.
 
-**No applications on that day is still `200`:**
+**No applications today is still `200`** — the lists are empty but statistics carry real history:
 
 ```json
 {
   "success": true,
   "data": {
     "studentId": 1000000002,
-    "date": "2026-10-25",
+    "date": "2026-10-29",
     "totalApplications": 0,
     "pageSize": 20,
     "totalPages": 0,
-    "pages": {}
+    "pages": {},
+    "statistics": {
+      "asOfDate": "2026-10-29",
+      "timezone": "America/Chicago",
+      "monthlyProgress": { "month": "2026-10", "applied": 785, "target": 1100, "remaining": 315, "percentage": 71 },
+      "todayProgress":   { "date": "2026-10-29", "applied": 0, "target": 50, "remaining": 50, "percentage": 0 },
+      "weeklyActivity":  { "weekStartDate": "2026-10-26", "targetPerWeekday": 50, "days": [ "... five entries ..." ] }
+    }
   }
 }
 ```
 
-Only the requesting student's applications are ever returned.
+Only the requesting student's applications and counts are ever returned. Statistics come from aggregate SQL, not
+from the page list. Weekday counts are bucketed by the reporting-zone date, and future weekdays report 0.
 
 #### Error responses
 
@@ -359,21 +386,27 @@ Checks run in the order below, and the first failure is returned.
 | 3 | 403 | `FORBIDDEN` | `Student authentication is not configured` | `ALLOW_DEV_STUDENT_HEADER` is not `true` on the server |
 | 4 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Student-Id` | header absent or blank |
 | 5 | 400 | `BAD_REQUEST` | `X-Dev-Student-Id must be a positive number` | header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
-| 6 | 400 | `BAD_REQUEST` | `Query parameter 'date' must be a valid date in YYYY-MM-DD format` | not a real calendar date in exactly that format: `25-10-2026`, `2026/10/25`, `2026-1-5`, `2026-02-30`, `2026-13-01`, or an empty value. Sending `date` twice is also rejected when API Gateway joins the values as `a,b` (the local `sam local` emulator may keep only one value instead) |
-| 7 | 400 | `BAD_REQUEST` | `Query parameter 'date' is outside the supported range` | well-formed but the year is before 1970 or after 9998 |
-| 8 | 404 | `NOT_FOUND` | `Student not found` | the student does not exist, is soft-deleted, or the id belongs to a user who is not a student |
-| 9 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; safe to retry |
-| 10 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure, including a server that is missing its database configuration |
+| 6 | 400 | `BAD_REQUEST` | `Query parameter '<name>' is not accepted; this endpoint always reports the current date and returns all pages` | a deprecated parameter was sent: `date`, `startDate`, `endDate`, `month`, `week`, `page` or `size` |
+| 7 | 404 | `NOT_FOUND` | `Student not found` | the student does not exist, is soft-deleted, or the id belongs to a user who is not a student |
+| 8 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; safe to retry |
+| 9 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure, including a server that is missing its database configuration |
 
 Notes:
 
-- A student with no applications is **not** a `404`; that is a `200` with empty `pages`.
-- The `404` in row 8 and the `404` in row 1 share the `NOT_FOUND` code. Their `message` differs.
+- A student with no applications today is **not** a `404`; that is a `200` with empty `pages`.
+- The `404` in row 7 and the `404` in row 1 share the `NOT_FOUND` code. Their `message` differs.
+
+#### Frontend caching
+
+The response carries `data.date` and `statistics.asOfDate`/`timezone`. A cached response must be invalidated when
+the reporting date changes, even if the client's own (~1 hour) cache has not expired. Applications created during
+the cache window do not appear until the next refresh. The payload is private student data: do not configure
+shared/public caching for it.
 
 ### Example
 
 ```bash
-curl -i "http://127.0.0.1:3000/api/v1/student/applications?date=2026-10-25" \
+curl -i "http://127.0.0.1:3000/api/v1/student/applications" \
   -H "X-Dev-Student-Id: 1000000002"
 ```
 
@@ -383,9 +416,9 @@ curl -i "http://127.0.0.1:3000/api/v1/student/applications?date=2026-10-25" \
 
 | Status | POST recruiter applications | GET student applications |
 |---|---|---|
-| **200** OK | not used | applications returned (including none) |
+| **200** OK | not used | today's applications and statistics returned (including none today) |
 | **201** Created | application recorded | not used |
-| **400** Bad Request | bad header, bad body, or failed field validation | bad header or bad `date` |
+| **400** Bad Request | bad header, bad body, or failed field validation | bad header, or a deprecated query parameter was sent |
 | **403** Forbidden | dev header not enabled; recruiter not assigned (or user missing/deleted); resume or cover letter not found | dev header not enabled |
 | **404** Not Found | unknown route | unknown route; student not found or deleted |
 | **405** Method Not Allowed | any method but `POST` (`Allow: POST`) | any method but `GET` (`Allow: GET`) |

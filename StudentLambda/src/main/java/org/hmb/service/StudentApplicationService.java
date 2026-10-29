@@ -2,6 +2,7 @@ package org.hmb.service;
 
 import org.hmb.dto.StudentApplicationDto;
 import org.hmb.dto.StudentApplicationsResponse;
+import org.hmb.dto.StudentStatisticsDto;
 import org.hmb.exception.ApiException;
 import org.hmb.repository.StudentApplicationRepository;
 import org.hmb.repository.StudentRepository;
@@ -24,15 +25,18 @@ import java.util.Map;
 import javax.sql.DataSource;
 
 /**
- * Returns every application recorded for a student on one calendar day, split into fixed-size pages.
+ * Returns today's applications for a student, split into fixed-size pages, together with dashboard statistics.
+ *
+ * <p>The reporting date is always "today" in the reporting zone (default America/Chicago), taken from an
+ * injectable {@link Clock}; there is no date parameter. The date is captured once per request so the applications
+ * and all statistics refer to the same day even around midnight.
  *
  * <p><b>Time handling.</b> {@code applications.applied_at} holds UTC wall-clock values (see
- * {@link StudentApplicationDto}). The requested {@code date} is a calendar day in the application time zone
- * (default America/Chicago), so it is converted to a half-open UTC range {@code [start, end)}. Daylight-saving
+ * {@link StudentApplicationDto}). Today is converted to a half-open UTC range {@code [start, end)}. Daylight-saving
  * days are therefore 23 or 25 hours long, never assumed to be 24.
  *
  * <p><b>Pagination</b> happens here in Java after the full day is loaded; the database is never asked for
- * LIMIT/OFFSET.
+ * LIMIT/OFFSET. The student check, the applications query and the statistics aggregate all run on one connection.
  */
 public class StudentApplicationService {
 
@@ -43,36 +47,40 @@ public class StudentApplicationService {
     private final DataSource dataSource;
     private final StudentRepository students;
     private final StudentApplicationRepository applications;
+    private final StudentStatisticsService statistics;
     private final ZoneId zone;
     private final Clock clock;
 
     public StudentApplicationService(DataSource dataSource,
                                      StudentRepository students,
                                      StudentApplicationRepository applications,
+                                     StudentStatisticsService statistics,
                                      ZoneId zone,
                                      Clock clock) {
         this.dataSource = dataSource;
         this.students = students;
         this.applications = applications;
+        this.statistics = statistics;
         this.zone = zone;
         this.clock = clock;
     }
 
     /**
      * @param studentId the student making the request (dev header today, JWT subject later)
-     * @param date      the calendar day in the application time zone, or null for "today" in that zone
      * @throws ApiException 404 unknown or soft-deleted student, 503 database unavailable, 500 anything else
      */
-    public StudentApplicationsResponse getApplications(long studentId, LocalDate date) {
-        LocalDate day = date != null ? date : LocalDate.now(clock.withZone(zone));
-        DayRange range = DayRange.of(day, zone);
+    public StudentApplicationsResponse getApplications(long studentId) {
+        LocalDate today = LocalDate.now(clock.withZone(zone));
+        DayRange range = DayRange.of(today, zone);
 
         List<StudentApplicationDto> found;
+        StudentStatisticsDto stats;
         try (Connection connection = dataSource.getConnection()) {
             if (!students.isActiveStudent(connection, studentId)) {
                 throw ApiException.notFound("Student not found");
             }
-            found = applications.findByStudentAndRange(connection, studentId, range.startUtc(), range.endUtc());
+            found = applications.findByStudentAndRange(connection, studentId, range.startUtc(), range.endUtc(), zone);
+            stats = statistics.calculate(connection, studentId, today);
         } catch (ApiException e) {
             LOG.warn("Rejected applications request for student {}: {} {}", studentId, e.getStatusCode(), e.getMessage());
             throw e;
@@ -84,9 +92,9 @@ public class StudentApplicationService {
         }
 
         Map<Integer, List<StudentApplicationDto>> pages = paginate(found, PAGE_SIZE);
-        LOG.info("Student {} has {} application(s) on {} ({} page(s))", studentId, found.size(), day, pages.size());
+        LOG.info("Student {} has {} application(s) on {} ({} page(s))", studentId, found.size(), today, pages.size());
         return StudentApplicationsResponse.of(new StudentApplicationsResponse.Data(
-                studentId, day.toString(), found.size(), PAGE_SIZE, pages.size(), pages));
+                studentId, today.toString(), found.size(), PAGE_SIZE, pages.size(), pages, stats));
     }
 
     /**

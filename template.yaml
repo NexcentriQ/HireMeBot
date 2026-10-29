@@ -65,8 +65,10 @@ Resources:
           DB_TRUSTSTORE_URL: ""
           DB_TRUSTSTORE_PASSWORD: ""
           DB_TRUSTSTORE_TYPE: PKCS12
-          # Calendar days (the `date` query parameter, and "today" when it is omitted) are in this zone.
+          # "Today" and the monthly/weekly reporting periods are calendar ranges in this zone.
           APP_TIMEZONE: America/Chicago
+          # Per-weekday application target; the monthly target is this times the weekdays in the month.
+          DAILY_APPLICATION_TARGET: "50"
           # X-Dev-Student-Id is NOT authentication. Keep "false" for any deployed stack; only the
           # local env.json turns it on. Replace with Cognito/JWT before exposing this API.
           ALLOW_DEV_STUDENT_HEADER: "false"

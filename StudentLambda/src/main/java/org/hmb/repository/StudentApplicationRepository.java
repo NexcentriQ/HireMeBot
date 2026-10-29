@@ -7,6 +7,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -48,7 +49,8 @@ public class StudentApplicationRepository {
      */
     public List<StudentApplicationDto> findByStudentAndRange(Connection connection, long studentId,
                                                              LocalDateTime startUtcInclusive,
-                                                             LocalDateTime endUtcExclusive) throws SQLException {
+                                                             LocalDateTime endUtcExclusive,
+                                                             ZoneId reportingZone) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(APPLICATIONS_SQL)) {
             statement.setLong(1, studentId);
             // LocalDateTime is sent as-is (no JVM time zone conversion), exactly like the stored UTC values.
@@ -64,7 +66,8 @@ public class StudentApplicationRepository {
                             rs.getString("job_location"),
                             rs.getString("job_link"),
                             rs.getString("job_source"),
-                            StudentApplicationDto.formatUtc(rs.getObject("applied_at", LocalDateTime.class))));
+                            StudentApplicationDto.formatAppliedAt(
+                                    rs.getObject("applied_at", LocalDateTime.class), reportingZone)));
                 }
                 return result;
             }

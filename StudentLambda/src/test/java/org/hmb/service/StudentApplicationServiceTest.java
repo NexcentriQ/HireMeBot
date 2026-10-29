@@ -2,6 +2,7 @@ package org.hmb.service;
 
 import org.hmb.dto.StudentApplicationDto;
 import org.hmb.dto.StudentApplicationsResponse;
+import org.hmb.dto.StudentStatisticsDto;
 import org.hmb.exception.ApiException;
 import org.hmb.repository.StudentApplicationRepository;
 import org.hmb.repository.StudentRepository;
@@ -32,10 +33,12 @@ import java.util.stream.Collectors;
 import javax.sql.DataSource;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -45,28 +48,36 @@ class StudentApplicationServiceTest {
 
     private static final long STUDENT_ID = 1000000002L;
     private static final ZoneId CHICAGO = ZoneId.of("America/Chicago");
-    private static final LocalDate DAY = LocalDate.of(2026, 10, 25);
+    /** 13:00 Chicago (CDT) on 2026-10-25, so "today" in the zone is 2026-10-25. */
+    private static final Instant NOW = Instant.parse("2026-10-25T18:00:00Z");
+    private static final LocalDate TODAY = LocalDate.of(2026, 10, 25);
+
+    private static final StudentStatisticsDto STATS = new StudentStatisticsDto(
+            "2026-10-25", "America/Chicago", null, null, null);
 
     @Mock DataSource dataSource;
     @Mock Connection connection;
     @Mock StudentRepository students;
     @Mock StudentApplicationRepository applications;
+    @Mock StudentStatisticsService statistics;
 
     private StudentApplicationService service;
 
     @BeforeEach
     void setUp() {
-        service = serviceAt(Instant.parse("2026-10-25T18:00:00Z"));
+        service = serviceAt(NOW);
     }
 
     private StudentApplicationService serviceAt(Instant now) {
-        return new StudentApplicationService(dataSource, students, applications, CHICAGO,
+        return new StudentApplicationService(dataSource, students, applications, statistics, CHICAGO,
                 Clock.fixed(now, ZoneOffset.UTC));
     }
 
-    private void studentExists() throws SQLException {
+    private void studentExistsWithApplications(List<StudentApplicationDto> apps) throws SQLException {
         when(dataSource.getConnection()).thenReturn(connection);
         when(students.isActiveStudent(connection, STUDENT_ID)).thenReturn(true);
+        when(applications.findByStudentAndRange(any(), anyLong(), any(), any(), any())).thenReturn(apps);
+        when(statistics.calculate(any(), anyLong(), any())).thenReturn(STATS);
     }
 
     /** Newest first, exactly as the repository's ORDER BY would return them. */
@@ -75,7 +86,7 @@ class StudentApplicationServiceTest {
         for (int i = 0; i < count; i++) {
             long id = 1000000000L + count - i;
             list.add(new StudentApplicationDto(id, "Title " + id, "Co", "Austin, TX", "https://example.test/" + id,
-                    "Src", "2026-10-25T15:30:00Z"));
+                    "Src", "2026-10-25T10:30:00-05:00"));
         }
         return list;
     }
@@ -89,11 +100,10 @@ class StudentApplicationServiceTest {
             "35 | 20,15",
             "50 | 20,20,10"})
     void splitsIntoPagesOfTwentyPreservingOrder(int count, String expectedPageSizes) throws SQLException {
-        studentExists();
         List<StudentApplicationDto> all = applicationsNewestFirst(count);
-        when(applications.findByStudentAndRange(any(), anyLong(), any(), any())).thenReturn(all);
+        studentExistsWithApplications(all);
 
-        StudentApplicationsResponse.Data data = service.getApplications(STUDENT_ID, DAY).data();
+        StudentApplicationsResponse.Data data = service.getApplications(STUDENT_ID).data();
 
         List<Integer> expectedSizes = expectedPageSizes.isBlank() ? List.of()
                 : Arrays.stream(expectedPageSizes.split(",")).map(String::trim).map(Integer::parseInt).toList();
@@ -104,11 +114,9 @@ class StudentApplicationServiceTest {
         for (int page = 1; page <= expectedSizes.size(); page++) {
             assertEquals(expectedSizes.get(page - 1), data.pages().get(page).size(), "size of page " + page);
         }
-        // Pages are numbered 1..n with no gaps, in order.
         assertEquals(java.util.stream.IntStream.rangeClosed(1, expectedSizes.size()).boxed().toList(),
                 new ArrayList<>(data.pages().keySet()));
 
-        // Concatenating the pages gives back the original order, and no application is on two pages.
         List<StudentApplicationDto> flattened = data.pages().values().stream().flatMap(List::stream).toList();
         assertEquals(all, flattened);
         Set<Long> ids = flattened.stream().map(StudentApplicationDto::applicationId).collect(Collectors.toSet());
@@ -116,27 +124,36 @@ class StudentApplicationServiceTest {
     }
 
     @Test
-    void responseEchoesStudentAndDate() throws SQLException {
-        studentExists();
-        when(applications.findByStudentAndRange(any(), anyLong(), any(), any())).thenReturn(List.of());
+    void responseEchoesStudentAndTodayAndAttachesStatistics() throws SQLException {
+        studentExistsWithApplications(List.of());
 
-        StudentApplicationsResponse response = service.getApplications(STUDENT_ID, DAY);
+        StudentApplicationsResponse response = service.getApplications(STUDENT_ID);
 
         assertTrue(response.success());
         assertEquals(STUDENT_ID, response.data().studentId());
         assertEquals("2026-10-25", response.data().date());
         assertTrue(response.data().pages().isEmpty());
+        assertSame(STATS, response.data().statistics());
     }
 
     @Test
-    void unknownOrSoftDeletedStudentIs404AndNoApplicationsAreRead() throws SQLException {
+    void statisticsRunOnTheSameConnectionForToday() throws SQLException {
+        studentExistsWithApplications(List.of());
+
+        service.getApplications(STUDENT_ID);
+
+        verify(statistics).calculate(connection, STUDENT_ID, TODAY);
+    }
+
+    @Test
+    void unknownOrSoftDeletedStudentIs404AndNothingElseRuns() throws SQLException {
         when(dataSource.getConnection()).thenReturn(connection);
         when(students.isActiveStudent(connection, STUDENT_ID)).thenReturn(false);
 
-        ApiException e = assertThrows(ApiException.class, () -> service.getApplications(STUDENT_ID, DAY));
+        ApiException e = assertThrows(ApiException.class, () -> service.getApplications(STUDENT_ID));
 
         assertEquals(404, e.getStatusCode());
-        verifyNoInteractions(applications);
+        verifyNoInteractions(applications, statistics);
         verify(connection).close();
     }
 
@@ -144,49 +161,48 @@ class StudentApplicationServiceTest {
     void databaseUnavailableIs503() throws SQLException {
         when(dataSource.getConnection()).thenThrow(new SQLTransientConnectionException("pool timeout", "08001"));
 
-        assertEquals(503, assertThrows(ApiException.class, () -> service.getApplications(STUDENT_ID, DAY)).getStatusCode());
-        verifyNoInteractions(students, applications);
+        assertEquals(503, assertThrows(ApiException.class, () -> service.getApplications(STUDENT_ID)).getStatusCode());
+        verifyNoInteractions(students, applications, statistics);
     }
 
     @Test
     void sqlErrorIs500AndDoesNotLeakDetails() throws SQLException {
-        studentExists();
-        when(applications.findByStudentAndRange(any(), anyLong(), any(), any()))
+        when(dataSource.getConnection()).thenReturn(connection);
+        when(students.isActiveStudent(connection, STUDENT_ID)).thenReturn(true);
+        when(applications.findByStudentAndRange(any(), anyLong(), any(), any(), any()))
                 .thenThrow(new SQLException("Unknown column 'secret_col' in 'field list'", "42S22", 1054));
 
-        ApiException e = assertThrows(ApiException.class, () -> service.getApplications(STUDENT_ID, DAY));
+        ApiException e = assertThrows(ApiException.class, () -> service.getApplications(STUDENT_ID));
 
         assertEquals(500, e.getStatusCode());
         assertTrue(!e.getMessage().contains("secret_col"));
     }
 
     /**
-     * 2026-10-26T03:00Z is still the evening of Oct 25 in Chicago (UTC-5), even though the UTC date is Oct 26.
-     * Omitting the date must follow the configured zone, not UTC.
+     * 2026-10-26T03:00Z is still the evening of Oct 25 in Chicago (UTC-5): "today" follows the zone, not UTC.
      */
     @Test
-    void omittedDateMeansTodayInTheConfiguredTimeZone() throws SQLException {
+    void todayFollowsTheConfiguredTimeZone() throws SQLException {
         service = serviceAt(Instant.parse("2026-10-26T03:00:00Z"));
-        studentExists();
-        when(applications.findByStudentAndRange(any(), anyLong(), any(), any())).thenReturn(List.of());
+        studentExistsWithApplications(List.of());
 
-        StudentApplicationsResponse response = service.getApplications(STUDENT_ID, null);
+        StudentApplicationsResponse response = service.getApplications(STUDENT_ID);
 
         assertEquals("2026-10-25", response.data().date());
         verify(applications).findByStudentAndRange(connection, STUDENT_ID,
-                LocalDateTime.parse("2026-10-25T05:00:00"), LocalDateTime.parse("2026-10-26T05:00:00"));
+                LocalDateTime.parse("2026-10-25T05:00:00"), LocalDateTime.parse("2026-10-26T05:00:00"), CHICAGO);
+        verify(statistics).calculate(connection, STUDENT_ID, LocalDate.of(2026, 10, 25));
     }
 
     @Test
-    void queriesTheUtcRangeOfTheRequestedLocalDay() throws SQLException {
-        studentExists();
-        when(applications.findByStudentAndRange(any(), anyLong(), any(), any())).thenReturn(List.of());
+    void queriesTheUtcRangeOfTodaysLocalDay() throws SQLException {
+        studentExistsWithApplications(List.of());
 
-        service.getApplications(STUDENT_ID, DAY);
+        service.getApplications(STUDENT_ID);
 
         ArgumentCaptor<LocalDateTime> start = ArgumentCaptor.forClass(LocalDateTime.class);
         ArgumentCaptor<LocalDateTime> end = ArgumentCaptor.forClass(LocalDateTime.class);
-        verify(applications).findByStudentAndRange(any(), anyLong(), start.capture(), end.capture());
+        verify(applications).findByStudentAndRange(any(), anyLong(), start.capture(), end.capture(), eq(CHICAGO));
         assertEquals(LocalDateTime.parse("2026-10-25T05:00:00"), start.getValue());   // CDT = UTC-5
         assertEquals(LocalDateTime.parse("2026-10-26T05:00:00"), end.getValue());
     }
@@ -204,16 +220,16 @@ class StudentApplicationServiceTest {
     @Test
     void fallBackDayIsTwentyFiveHours() {
         var range = StudentApplicationService.DayRange.of(LocalDate.of(2026, 11, 1), CHICAGO);
-        assertEquals(LocalDateTime.parse("2026-11-01T05:00:00"), range.startUtc());   // midnight CDT
-        assertEquals(LocalDateTime.parse("2026-11-02T06:00:00"), range.endUtc());     // midnight CST
+        assertEquals(LocalDateTime.parse("2026-11-01T05:00:00"), range.startUtc());
+        assertEquals(LocalDateTime.parse("2026-11-02T06:00:00"), range.endUtc());
     }
 
     /** US clocks go forward on 2026-03-08: that Chicago day lasts 23 hours. */
     @Test
     void springForwardDayIsTwentyThreeHours() {
         var range = StudentApplicationService.DayRange.of(LocalDate.of(2026, 3, 8), CHICAGO);
-        assertEquals(LocalDateTime.parse("2026-03-08T06:00:00"), range.startUtc());   // midnight CST
-        assertEquals(LocalDateTime.parse("2026-03-09T05:00:00"), range.endUtc());     // midnight CDT
+        assertEquals(LocalDateTime.parse("2026-03-08T06:00:00"), range.startUtc());
+        assertEquals(LocalDateTime.parse("2026-03-09T05:00:00"), range.endUtc());
     }
 
     @Test

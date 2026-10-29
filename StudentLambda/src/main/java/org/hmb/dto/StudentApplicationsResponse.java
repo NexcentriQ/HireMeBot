@@ -8,7 +8,8 @@ import java.util.Map;
  *
  * <p>{@code pages} maps 1-based page numbers to that page's applications, in insertion (= page) order. Jackson
  * writes the integer keys as JSON strings ({@code "1"}, {@code "2"}, ...). It is empty when there are no
- * applications.
+ * applications. {@code date} and {@code totalApplications} are about <em>today</em>; broader counts live in
+ * {@code statistics}.
  */
 public record StudentApplicationsResponse(boolean success, Data data) {
 
@@ -18,7 +19,8 @@ public record StudentApplicationsResponse(boolean success, Data data) {
             int totalApplications,
             int pageSize,
             int totalPages,
-            Map<Integer, List<StudentApplicationDto>> pages) {
+            Map<Integer, List<StudentApplicationDto>> pages,
+            StudentStatisticsDto statistics) {
     }
 
     public static StudentApplicationsResponse of(Data data) {
