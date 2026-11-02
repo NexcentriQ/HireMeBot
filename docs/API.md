@@ -1,11 +1,12 @@
 # HireMeBot API Reference
 
-Two endpoints, each backed by its own Lambda:
+Three endpoints, served by two Lambdas:
 
 | Endpoint | Purpose | Lambda |
 |---|---|---|
 | [`POST /api/v1/recruiter/applications`](#1-post-apiv1recruiterapplications) | A recruiter records a job application they already made for an assigned student | RecruiterLambda |
-| [`GET /api/v1/student/applications`](#2-get-apiv1studentapplications) | A student's dashboard: today's recorded applications plus monthly/daily/weekly progress statistics | StudentLambda |
+| [`GET /api/v1/recruiter/students`](#2-get-apiv1recruiterstudents) | A recruiter lists their active assigned students (fills the Apply Job form's student dropdown) | RecruiterLambda |
+| [`GET /api/v1/student/applications`](#3-get-apiv1studentapplications) | A student's dashboard: today's recorded applications plus monthly/daily/weekly progress statistics | StudentLambda |
 
 > **Status: development only.** Authentication is not implemented yet. Callers are identified by temporary
 > `X-Dev-*` headers that are **not authentication** and are accepted only when the server is started with the
@@ -53,7 +54,7 @@ Error bodies never contain SQL, stack traces, hostnames or credentials; the tech
 |---|---|---|
 | `BAD_REQUEST` | 400 | the request is malformed (header, query parameter, or JSON body) |
 | `VALIDATION_ERROR` | 400 | the JSON body parsed but one or more fields are invalid; see `details` |
-| `FORBIDDEN` | 403 | the caller is not allowed to do this, or a referenced object does not exist |
+| `FORBIDDEN` | 403 | the caller is not allowed to do this (including a recruiter who does not exist or is deleted), or a referenced object does not exist |
 | `NOT_FOUND` | 404 | unknown route, or the student does not exist |
 | `METHOD_NOT_ALLOWED` | 405 | the route exists but not for this HTTP method (response includes an `Allow` header) |
 | `CONFLICT` | 409 | the application already exists |
@@ -65,6 +66,7 @@ Error bodies never contain SQL, stack traces, hostnames or credentials; the tech
 | Endpoint | Header | Server flag that enables it |
 |---|---|---|
 | POST recruiter applications | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` |
+| GET recruiter students | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` (same flag as the POST) |
 | GET student applications | `X-Dev-Student-Id: <student user_id>` | `ALLOW_DEV_STUDENT_HEADER=true` |
 
 The flag defaults to `false`. While it is `false`, the endpoint answers **403** to every request, whatever headers
@@ -239,10 +241,136 @@ curl -i -X POST http://127.0.0.1:3000/api/v1/recruiter/applications \
 
 ---
 
-## 2. `GET /api/v1/student/applications`
+## 2. `GET /api/v1/recruiter/students`
 
-The student dashboard in one call. Returns **today's** applications (newest first, in pages of 20, all pages in one
-response) and **statistics** (monthly progress, today's progress, Monday-to-Friday weekly activity). The backend
+Lists the **active students assigned to the requesting recruiter**. It supplies the *Assigned Student* dropdown on
+Step 1 of the Apply Job form: show `fullName` (and optionally `email`) as the label, use `studentId` as the value, and
+send that `studentId` in the [POST above](#1-post-apiv1recruiterapplications). Everything is returned in one response;
+there is no pagination. It is read-only.
+
+### Request
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `X-Dev-Recruiter-Id` | yes | positive integer: the recruiter's `user_id` (development only, see [Authentication](#authentication-development-only)) |
+| `Accept` | no | `application/json`; not enforced |
+
+No body and no query parameters. The recruiter is identified **only** by the header: a `recruiterId` in the query
+string is ignored, never trusted.
+
+**Which students are returned.** Those with a row in `recruiter_student_assignments` for this recruiter whose user is
+not soft-deleted. A student assigned to another recruiter is never returned. The schema has no separate "active"
+flag, so "active" means `users.is_deleted = FALSE`.
+
+**Order.** Alphabetical by `firstName`, then `lastName`, then `studentId`, as applied by MySQL's default
+case-insensitive collation.
+
+### Responses
+
+#### `200 OK`
+
+```json
+{
+  "success": true,
+  "data": {
+    "recruiterId": 1000000001,
+    "totalStudents": 3,
+    "students": [
+      {
+        "studentId": 1000000002,
+        "firstName": "John",
+        "lastName": "Smith",
+        "fullName": "John Smith",
+        "email": "john.smith@example.com",
+        "assignedAt": "2026-10-20T14:30:00Z"
+      },
+      {
+        "studentId": 1000000004,
+        "firstName": "Michael",
+        "lastName": "Brown",
+        "fullName": "Michael Brown",
+        "email": "michael.brown@example.com",
+        "assignedAt": "2026-10-22T19:45:00Z"
+      },
+      {
+        "studentId": 1000000003,
+        "firstName": "Sarah",
+        "lastName": "Johnson",
+        "fullName": "Sarah Johnson",
+        "email": "sarah.johnson@example.com",
+        "assignedAt": "2026-10-21T16:15:00Z"
+      }
+    ]
+  }
+}
+```
+
+All values are illustrative.
+
+| Field | Type | Description |
+|---|---|---|
+| `data.recruiterId` | integer | the recruiter from the header |
+| `data.totalStudents` | integer | number of entries in `students` |
+| `data.students` | array | the assigned active students; `[]` when there are none (never `null`) |
+| `students[].studentId` | integer | student id: use as the dropdown value |
+| `students[].firstName`, `lastName` | string | trimmed |
+| `students[].fullName` | string | trimmed first and last name joined by a single space |
+| `students[].email` | string | |
+| `students[].assignedAt` | string | when the assignment was made: a UTC instant ending in `Z`, e.g. `2026-10-20T14:30:00Z`. Convert it for display. `null` only if the database value is empty |
+
+Deliberately **not** returned: phone number, verification flags, deletion flag, manager or recruiter details.
+
+**A recruiter with no assigned students is still `200`:**
+
+```json
+{ "success": true, "data": { "recruiterId": 1000000001, "totalStudents": 0, "students": [] } }
+```
+
+#### Error responses
+
+Checks run in the order below, and the first failure is returned.
+
+| # | Status | `error` | `message` | Cause |
+|---|---|---|---|---|
+| 1 | 404 | `NOT_FOUND` | `Route not found` | path is not one of the recruiter routes |
+| 2 | 405 | `METHOD_NOT_ALLOWED` | `Method not allowed; use GET` | method is not `GET`; response has header `Allow: GET` |
+| 3 | 403 | `FORBIDDEN` | `Recruiter authentication is not configured` | `ALLOW_DEV_RECRUITER_HEADER` is not `true` on the server |
+| 4 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Recruiter-Id` | header absent or blank |
+| 5 | 400 | `BAD_REQUEST` | `X-Dev-Recruiter-Id must be a positive number` | header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
+| 6 | 403 | `FORBIDDEN` | `Recruiter does not exist or is not active` | no `recruiters` row for that id, the id belongs to a user who is not a recruiter, or the recruiter is soft-deleted |
+| 7 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; safe to retry |
+| 8 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure, including a server that is missing its database configuration |
+
+Notes:
+
+- A recruiter with no students is **not** an error: that is a `200` with an empty `students` array.
+- An unknown recruiter is a `403`, not a `404`, consistent with the POST above.
+- The two recruiter routes are matched on **path and method**: `POST` to `/api/v1/recruiter/students` is a `405` with
+  `Allow: GET`, and `GET` to `/api/v1/recruiter/applications` is a `405` with `Allow: POST`.
+
+### Example
+
+```bash
+curl -i "http://127.0.0.1:3000/api/v1/recruiter/students" \
+  -H "Accept: application/json" \
+  -H "X-Dev-Recruiter-Id: 1000000001"
+```
+
+```powershell
+curl.exe -i "http://127.0.0.1:3000/api/v1/recruiter/students" `
+  -H "Accept: application/json" `
+  -H "X-Dev-Recruiter-Id: 1000000001"
+```
+
+---
+
+## 3. `GET /api/v1/student/applications`
+
+The student dashboard in one call. Returns the student's **profile** (for the greeting and the Profile page),
+**today's** applications (newest first, in pages of 20, all pages in one response) and **statistics** (monthly
+progress, today's progress, Monday-to-Friday weekly activity). The backend
 always reports the current date; there is **no `date` parameter and no pagination parameters**. Page navigation and
 caching are the client's job.
 
@@ -280,6 +408,13 @@ belongs to the day/week/month it was recorded in *in that zone*, so one recorded
   "data": {
     "studentId": 1000000002,
     "date": "2026-10-29",
+    "student": {
+      "firstName": "John",
+      "lastName": "Smith",
+      "email": "john.smith@example.com",
+      "phoneE164": "+17135550123",
+      "phoneVerified": false
+    },
     "totalApplications": 35,
     "pageSize": 20,
     "totalPages": 2,
@@ -334,6 +469,11 @@ belongs to the day/week/month it was recorded in *in that zone*, so one recorded
 |---|---|---|
 | `data.studentId` | integer | the student from the header |
 | `data.date` | string | **today** in the reporting zone, `YYYY-MM-DD` |
+| `data.student` | object | the requesting student's profile; always present on a `200`, even when there are no applications today |
+| `student.firstName`, `student.lastName` | string | from the student's user record, trimmed |
+| `student.email` | string | from the student's user record |
+| `student.phoneE164` | string or `null` | the phone number **exactly as stored in the database** (surrounding whitespace removed), or `null` if none is stored. The field is always present. It is E.164 only if it was stored that way: see the note below |
+| `student.phoneVerified` | boolean | the database's `phone_verified` flag, as stored. Show a "Verified" badge only when this is `true` |
 | `data.totalApplications` | integer | **today's** application count, across all pages (equals `statistics.todayProgress.applied`) |
 | `data.pageSize` | integer | always `20` |
 | `data.totalPages` | integer | number of pages; `0` when there are none today |
@@ -349,7 +489,8 @@ belongs to the day/week/month it was recorded in *in that zone*, so one recorded
 
 Page sizes: 10 give one page of 10; 20 give one page of 20; 21 give 20 and 1; 35 give 20 and 15; 50 give 20, 20, 10.
 
-**No applications today is still `200`** — the lists are empty but statistics carry real history:
+**No applications today is still `200`.** The lists are empty, but the profile is still returned and the statistics
+carry real history (this example also shows a student with no phone stored, so `phoneE164` is `null`):
 
 ```json
 {
@@ -357,6 +498,13 @@ Page sizes: 10 give one page of 10; 20 give one page of 20; 21 give 20 and 1; 35
   "data": {
     "studentId": 1000000002,
     "date": "2026-10-29",
+    "student": {
+      "firstName": "John",
+      "lastName": "Smith",
+      "email": "john.smith@example.com",
+      "phoneE164": null,
+      "phoneVerified": false
+    },
     "totalApplications": 0,
     "pageSize": 20,
     "totalPages": 0,
@@ -372,7 +520,16 @@ Page sizes: 10 give one page of 10; 20 give one page of 20; 21 give 20 and 1; 35
 }
 ```
 
-Only the requesting student's applications and counts are ever returned. Statistics come from aggregate SQL, not
+**About `student.phoneE164`.** The database stores the phone in a free-form `VARCHAR(16)` and does not enforce any
+format, so the API returns whatever is stored and never reformats or guesses a number: it never adds a country code
+(`7135550123` stays `7135550123`, it does **not** become `+17135550123`) and never assumes a US number. The field keeps
+the name `phoneE164` for the frontend contract, but the value is **not validated**: it is a true E.164 number only if it
+was stored that way (for example `+17135550123`), and it may also be digits without a `+`, or contain spaces,
+parentheses or dashes. Treat it as a display string, and do not pass it to anything that requires E.164 (such as an SMS
+provider) without validating it first. It is `null` only when no phone is stored. `phoneVerified` is independent of the
+number: it is never inferred from it and reports the database flag as stored.
+
+Only the requesting student's profile, applications and counts are ever returned. Statistics come from aggregate SQL, not
 from the page list. Weekday counts are bucketed by the reporting-zone date, and future weekdays report 0.
 
 #### Error responses
@@ -393,15 +550,17 @@ Checks run in the order below, and the first failure is returned.
 
 Notes:
 
-- A student with no applications today is **not** a `404`; that is a `200` with empty `pages`.
+- A student with no applications today is **not** a `404`; that is a `200` with empty `pages` (and their profile).
 - The `404` in row 7 and the `404` in row 1 share the `NOT_FOUND` code. Their `message` differs.
+- Row 7 returns only the error envelope: no profile, application or statistics data is ever returned for a student
+  who is not found, and a different student's data is never substituted.
 
 #### Frontend caching
 
 The response carries `data.date` and `statistics.asOfDate`/`timezone`. A cached response must be invalidated when
 the reporting date changes, even if the client's own (~1 hour) cache has not expired. Applications created during
-the cache window do not appear until the next refresh. The payload is private student data: do not configure
-shared/public caching for it.
+the cache window do not appear until the next refresh, and neither do changes to the profile (name, email, phone,
+verification). The payload is private student data (name, email, phone): do not configure shared/public caching for it.
 
 ### Example
 
@@ -414,19 +573,19 @@ curl -i "http://127.0.0.1:3000/api/v1/student/applications" \
 
 ## Status code summary
 
-| Status | POST recruiter applications | GET student applications |
-|---|---|---|
-| **200** OK | not used | today's applications and statistics returned (including none today) |
-| **201** Created | application recorded | not used |
-| **400** Bad Request | bad header, bad body, or failed field validation | bad header, or a deprecated query parameter was sent |
-| **403** Forbidden | dev header not enabled; recruiter not assigned (or user missing/deleted); resume or cover letter not found | dev header not enabled |
-| **404** Not Found | unknown route | unknown route; student not found or deleted |
-| **405** Method Not Allowed | any method but `POST` (`Allow: POST`) | any method but `GET` (`Allow: GET`) |
-| **409** Conflict | duplicate application for this student and job link | not used |
-| **500** Internal Server Error | unexpected failure | unexpected failure |
-| **503** Service Unavailable | database temporarily unreachable (retry) | database temporarily unreachable (retry) |
+| Status | POST recruiter applications | GET recruiter students | GET student applications |
+|---|---|---|---|
+| **200** OK | not used | assigned students returned (including none) | today's applications and statistics returned (including none today) |
+| **201** Created | application recorded | not used | not used |
+| **400** Bad Request | bad header, bad body, or failed field validation | missing or invalid `X-Dev-Recruiter-Id` | bad header, or a deprecated query parameter was sent |
+| **403** Forbidden | dev header not enabled; recruiter not assigned (or user missing/deleted); resume or cover letter not found | dev header not enabled; recruiter does not exist or is deleted | dev header not enabled |
+| **404** Not Found | unknown route | unknown route | unknown route; student not found or deleted |
+| **405** Method Not Allowed | any method but `POST` (`Allow: POST`) | any method but `GET` (`Allow: GET`) | any method but `GET` (`Allow: GET`) |
+| **409** Conflict | duplicate application for this student and job link | not used | not used |
+| **500** Internal Server Error | unexpected failure | unexpected failure | unexpected failure |
+| **503** Service Unavailable | database temporarily unreachable (retry) | database temporarily unreachable (retry) | database temporarily unreachable (retry) |
 
-Retry guidance: `503` is transient and safe to retry for both endpoints (nothing was stored on a failed `POST`).
+Retry guidance: `503` is transient and safe to retry for every endpoint (nothing was stored on a failed `POST`).
 Do not blindly retry `400`, `403`, `404`, `405` or `409`; they will fail the same way until the request or the data
 changes. Retrying a `500` is reasonable but may repeat the failure.
 

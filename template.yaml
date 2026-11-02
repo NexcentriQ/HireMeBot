@@ -43,6 +43,11 @@ Resources:
           Properties:
             Path: /api/v1/recruiter/applications
             Method: post
+        ListAssignedStudents:
+          Type: HttpApi
+          Properties:
+            Path: /api/v1/recruiter/students
+            Method: get
 
   StudentFunction:
     Type: AWS::Serverless::Function
@@ -83,6 +88,9 @@ Outputs:
   RecruiterApplicationsUrl:
     Description: "HTTP API URL for POST /api/v1/recruiter/applications"
     Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/recruiter/applications"
+  RecruiterStudentsUrl:
+    Description: "HTTP API URL for GET /api/v1/recruiter/students"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/recruiter/students"
   RecruiterFunction:
     Description: "Recruiter Lambda Function ARN"
     Value: !GetAtt RecruiterFunction.Arn

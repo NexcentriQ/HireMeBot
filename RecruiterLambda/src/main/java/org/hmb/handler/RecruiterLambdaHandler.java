@@ -12,14 +12,15 @@ import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.hmb.config.DatabaseConfig;
 import org.hmb.dto.RecruiterRequest;
-import org.hmb.dto.RecruiterResponse;
 import org.hmb.exception.ApiException;
 import org.hmb.exception.ErrorResponse;
 import org.hmb.repository.ApplicationRepository;
 import org.hmb.repository.AssignmentRepository;
 import org.hmb.repository.DocumentRepository;
 import org.hmb.repository.QuestionRepository;
+import org.hmb.repository.RecruiterRepository;
 import org.hmb.service.ApplicationService;
+import org.hmb.service.RecruiterStudentService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,7 +31,12 @@ import java.util.TreeMap;
 import java.util.function.Supplier;
 
 /**
- * Lambda entry point for {@code POST /api/v1/recruiter/applications}.
+ * Lambda entry point for the recruiter API:
+ * <ul>
+ *   <li>{@code POST /api/v1/recruiter/applications}: record an application for an assigned student</li>
+ *   <li>{@code GET /api/v1/recruiter/students}: list the recruiter's active assigned students</li>
+ * </ul>
+ * Routes are matched on path <em>and</em> method.
  *
  * <p><b>The {@code X-Dev-Recruiter-Id} header is NOT authentication.</b> It exists only for local development
  * and is honoured only when the environment variable {@code ALLOW_DEV_RECRUITER_HEADER} is {@code true}.
@@ -38,9 +44,31 @@ import java.util.function.Supplier;
  */
 public class RecruiterLambdaHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse> {
 
-    static final String ROUTE_PATH = "/api/v1/recruiter/applications";
     static final String DEV_RECRUITER_HEADER = "X-Dev-Recruiter-Id";
     static final String DEV_HEADER_ENABLE_VAR = "ALLOW_DEV_RECRUITER_HEADER";
+
+    /** The routes this Lambda serves. A path has exactly one allowed method. */
+    enum Route {
+        CREATE_APPLICATION("/api/v1/recruiter/applications", "POST"),
+        LIST_STUDENTS("/api/v1/recruiter/students", "GET");
+
+        final String path;
+        final String method;
+
+        Route(String path, String method) {
+            this.path = path;
+            this.method = method;
+        }
+
+        static Route forPath(String path) {
+            for (Route route : values()) {
+                if (route.path.equals(path)) {
+                    return route;
+                }
+            }
+            return null;
+        }
+    }
 
     private static final Logger LOG = LoggerFactory.getLogger(RecruiterLambdaHandler.class);
 
@@ -52,23 +80,29 @@ public class RecruiterLambdaHandler implements RequestHandler<APIGatewayV2HTTPEv
             .build();
 
     private static volatile ApplicationService defaultService;
+    private static volatile RecruiterStudentService defaultStudentService;
 
     private final Supplier<ApplicationService> serviceSupplier;
+    private final Supplier<RecruiterStudentService> studentServiceSupplier;
     private final boolean devHeaderEnabled;
 
     /** Used by the Lambda runtime. Resources are created lazily and reused while the environment is warm. */
     public RecruiterLambdaHandler() {
-        this(RecruiterLambdaHandler::defaultService,
+        this(RecruiterLambdaHandler::defaultService, RecruiterLambdaHandler::defaultStudentService,
                 "true".equalsIgnoreCase(System.getenv(DEV_HEADER_ENABLE_VAR)));
     }
 
     /** For tests. */
-    public RecruiterLambdaHandler(ApplicationService service, boolean devHeaderEnabled) {
-        this(() -> service, devHeaderEnabled);
+    public RecruiterLambdaHandler(ApplicationService service, RecruiterStudentService studentService,
+                                  boolean devHeaderEnabled) {
+        this(() -> service, () -> studentService, devHeaderEnabled);
     }
 
-    private RecruiterLambdaHandler(Supplier<ApplicationService> serviceSupplier, boolean devHeaderEnabled) {
+    private RecruiterLambdaHandler(Supplier<ApplicationService> serviceSupplier,
+                                   Supplier<RecruiterStudentService> studentServiceSupplier,
+                                   boolean devHeaderEnabled) {
         this.serviceSupplier = serviceSupplier;
+        this.studentServiceSupplier = studentServiceSupplier;
         this.devHeaderEnabled = devHeaderEnabled;
     }
 
@@ -88,17 +122,37 @@ public class RecruiterLambdaHandler implements RequestHandler<APIGatewayV2HTTPEv
         return local;
     }
 
+    private static RecruiterStudentService defaultStudentService() {
+        RecruiterStudentService local = defaultStudentService;
+        if (local == null) {
+            synchronized (RecruiterLambdaHandler.class) {
+                local = defaultStudentService;
+                if (local == null) {
+                    local = new RecruiterStudentService(DatabaseConfig.getDataSource(),
+                            new RecruiterRepository(), new AssignmentRepository());
+                    defaultStudentService = local;
+                }
+            }
+        }
+        return local;
+    }
+
     @Override
     public APIGatewayV2HTTPResponse handleRequest(APIGatewayV2HTTPEvent event, Context context) {
         try {
-            checkRoute(event);
+            Route route = resolveRoute(event);
             long recruiterId = readRecruiterId(event);
-            RecruiterRequest request = parseBody(event);
 
-            RecruiterResponse result = serviceSupplier.get().createApplication(recruiterId, request);
-            return json(201, result, Map.of());
+            return switch (route) {
+                case CREATE_APPLICATION -> {
+                    RecruiterRequest request = parseBody(event);
+                    yield json(201, serviceSupplier.get().createApplication(recruiterId, request), Map.of());
+                }
+                case LIST_STUDENTS ->
+                        json(200, studentServiceSupplier.get().getAssignedStudents(recruiterId), Map.of());
+            };
         } catch (ApiException e) {
-            Map<String, String> extra = e.getStatusCode() == 405 ? Map.of("Allow", "POST") : Map.of();
+            Map<String, String> extra = e.getStatusCode() == 405 ? Map.of("Allow", allowedMethod(event)) : Map.of();
             return json(e.getStatusCode(), ErrorResponse.from(e), extra);
         } catch (Exception e) {
             LOG.error("Unhandled error", e);
@@ -106,24 +160,40 @@ public class RecruiterLambdaHandler implements RequestHandler<APIGatewayV2HTTPEv
         }
     }
 
-    private static void checkRoute(APIGatewayV2HTTPEvent event) {
+    /** Matches the path first (404 if unknown), then the method (405 if the route does not allow it). */
+    private static Route resolveRoute(APIGatewayV2HTTPEvent event) {
+        Route route = Route.forPath(normalizedPath(event));
+        if (route == null) {
+            throw new ApiException(404, "NOT_FOUND", "Route not found");
+        }
+        if (!route.method.equalsIgnoreCase(requestMethod(event))) {
+            throw new ApiException(405, "METHOD_NOT_ALLOWED", "Method not allowed; use " + route.method);
+        }
+        return route;
+    }
+
+    /** The method the matched path allows, for the {@code Allow} header of a 405. */
+    private static String allowedMethod(APIGatewayV2HTTPEvent event) {
+        Route route = Route.forPath(normalizedPath(event));
+        return route == null ? "" : route.method;
+    }
+
+    private static String normalizedPath(APIGatewayV2HTTPEvent event) {
         String path = event.getRawPath();
-        String method = null;
-        if (event.getRequestContext() != null && event.getRequestContext().getHttp() != null) {
-            method = event.getRequestContext().getHttp().getMethod();
-            if (path == null) {
-                path = event.getRequestContext().getHttp().getPath();
-            }
+        if (path == null && event.getRequestContext() != null && event.getRequestContext().getHttp() != null) {
+            path = event.getRequestContext().getHttp().getPath();
         }
         if (path != null && path.length() > 1 && path.endsWith("/")) {
             path = path.substring(0, path.length() - 1);
         }
-        if (!ROUTE_PATH.equals(path)) {
-            throw new ApiException(404, "NOT_FOUND", "Route not found");
+        return path;
+    }
+
+    private static String requestMethod(APIGatewayV2HTTPEvent event) {
+        if (event.getRequestContext() != null && event.getRequestContext().getHttp() != null) {
+            return event.getRequestContext().getHttp().getMethod();
         }
-        if (!"POST".equalsIgnoreCase(method)) {
-            throw new ApiException(405, "METHOD_NOT_ALLOWED", "Method not allowed; use POST");
-        }
+        return null;
     }
 
     private long readRecruiterId(APIGatewayV2HTTPEvent event) {

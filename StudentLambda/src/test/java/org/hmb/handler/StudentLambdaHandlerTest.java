@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.hmb.dto.MonthlyProgressDto;
 import org.hmb.dto.StudentApplicationDto;
 import org.hmb.dto.StudentApplicationsResponse;
+import org.hmb.dto.StudentProfileDto;
 import org.hmb.dto.StudentStatisticsDto;
 import org.hmb.dto.TodayProgressDto;
 import org.hmb.dto.WeeklyActivityDto;
@@ -93,7 +94,11 @@ class StudentLambdaHandlerTest {
         pages.put(1, List.of(new StudentApplicationDto(1000000035L, "Senior Java Backend Developer", "Amazon",
                 "Austin, TX", "https://example.com/jobs/35", "Amazon Careers", "2026-10-29T10:30:00-05:00")));
         return StudentApplicationsResponse.of(new StudentApplicationsResponse.Data(
-                STUDENT_ID, "2026-10-29", 1, 20, 1, pages, sampleStatistics()));
+                STUDENT_ID, "2026-10-29", sampleProfile(), 1, 20, 1, pages, sampleStatistics()));
+    }
+
+    private static StudentProfileDto sampleProfile() {
+        return StudentProfileDto.of("John", "Smith", "john.smith@example.com", "+17135550123", false);
     }
 
     @Test
@@ -128,7 +133,7 @@ class StudentLambdaHandlerTest {
     @Test
     void emptyResultIsA200WithEmptyPagesObject() throws Exception {
         when(service.getApplications(anyLong())).thenReturn(StudentApplicationsResponse.of(
-                new StudentApplicationsResponse.Data(STUDENT_ID, "2026-10-29", 0, 20, 0,
+                new StudentApplicationsResponse.Data(STUDENT_ID, "2026-10-29", sampleProfile(), 0, 20, 0,
                         new LinkedHashMap<>(), sampleStatistics())));
 
         JsonNode data = JSON.readTree(get(studentHeader("1000000002")).getBody()).get("data");
@@ -139,6 +144,80 @@ class StudentLambdaHandlerTest {
         assertEquals(0, data.get("pages").size());
         // Statistics still carry real historical numbers even when today is empty.
         assertEquals(820, data.get("statistics").get("monthlyProgress").get("applied").asInt());
+        // ...and so does the profile.
+        assertEquals("John", data.get("student").get("firstName").asText());
+    }
+
+    // ---- student profile in the JSON contract ---------------------------------------------------------------
+
+    @Test
+    void studentProfileUsesTheFrontendContractPropertyNames() throws Exception {
+        when(service.getApplications(STUDENT_ID)).thenReturn(sampleResponse());
+
+        JsonNode student = JSON.readTree(get(studentHeader("1000000002")).getBody()).get("data").get("student");
+
+        assertEquals(List.of("firstName", "lastName", "email", "phoneE164", "phoneVerified"),
+                java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(student.fieldNames(), 0), false).toList());
+        assertEquals("John", student.get("firstName").asText());
+        assertEquals("Smith", student.get("lastName").asText());
+        assertEquals("john.smith@example.com", student.get("email").asText());
+        assertEquals("+17135550123", student.get("phoneE164").asText());
+        assertTrue(student.get("phoneVerified").isBoolean());
+        assertEquals(false, student.get("phoneVerified").asBoolean());
+    }
+
+    @Test
+    void studentSitsBetweenDateAndTotalApplicationsAndAllExistingFieldsRemain() throws Exception {
+        when(service.getApplications(STUDENT_ID)).thenReturn(sampleResponse());
+
+        JsonNode data = JSON.readTree(get(studentHeader("1000000002")).getBody()).get("data");
+
+        assertEquals(List.of("studentId", "date", "student", "totalApplications", "pageSize", "totalPages", "pages",
+                        "statistics"),
+                java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(data.fieldNames(), 0), false).toList());
+    }
+
+    @Test
+    void aStoredPhoneInAnyFormatIsReturnedAsStored() throws Exception {
+        StudentProfileDto plainDigits = StudentProfileDto.of("Student", "One", "student1@example.com", "9123456789", false);
+        when(service.getApplications(STUDENT_ID)).thenReturn(StudentApplicationsResponse.of(
+                new StudentApplicationsResponse.Data(STUDENT_ID, "2026-10-29", plainDigits, 0, 20, 0,
+                        new LinkedHashMap<>(), sampleStatistics())));
+
+        JsonNode student = JSON.readTree(get(studentHeader("1000000002")).getBody()).get("data").get("student");
+
+        assertEquals("9123456789", student.get("phoneE164").asText());
+        assertEquals(false, student.get("phoneVerified").asBoolean());
+    }
+
+    @Test
+    void phoneE164IsAlwaysPresentAndNullOnlyWhenNoPhoneIsStored() throws Exception {
+        StudentProfileDto noPhone = StudentProfileDto.of("Jane", "Doe", "jane@example.test", "", true);
+        when(service.getApplications(STUDENT_ID)).thenReturn(StudentApplicationsResponse.of(
+                new StudentApplicationsResponse.Data(STUDENT_ID, "2026-10-29", noPhone, 0, 20, 0,
+                        new LinkedHashMap<>(), sampleStatistics())));
+
+        String body = get(studentHeader("1000000002")).getBody();
+        JsonNode student = JSON.readTree(body).get("data").get("student");
+
+        assertTrue(student.has("phoneE164"), "the field must stay in the contract even when null: " + body);
+        assertTrue(student.get("phoneE164").isNull());
+        assertEquals(true, student.get("phoneVerified").asBoolean());
+    }
+
+    @Test
+    void studentNotFoundReturnsTheErrorEnvelopeWithNoProfileData() throws Exception {
+        when(service.getApplications(anyLong())).thenThrow(ApiException.notFound("Student not found"));
+
+        JsonNode root = JSON.readTree(get(studentHeader("1000000002")).getBody());
+
+        assertFalse(root.get("success").asBoolean());
+        assertFalse(root.has("data"));
+        assertEquals(List.of("success", "error", "message"),
+                java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(root.fieldNames(), 0), false).toList());
     }
 
     @Test

@@ -1,8 +1,9 @@
 # StudentLambda
 
-`GET /api/v1/student/applications`: the student dashboard in one call. It returns **today's** applications
-(newest first, split into pages of 20, all pages in one response) plus **statistics**: monthly progress, today's
-progress, and Monday-to-Friday weekly activity. The frontend caches the whole response and navigates pages itself.
+`GET /api/v1/student/applications`: the student dashboard in one call. It returns the student's **profile**
+(`data.student`: name, email, phone, phone-verified), **today's** applications (newest first, split into pages of 20,
+all pages in one response) plus **statistics**: monthly progress, today's progress, and Monday-to-Friday weekly
+activity. The frontend caches the whole response and navigates pages itself.
 
 There is **no `date` parameter and no pagination parameters**. The backend always reports the current date in the
 reporting zone and returns every page at once.
@@ -17,11 +18,12 @@ reporting zone and returns every page at once.
 ```
 org.hmb
 ├── handler/StudentLambdaHandler            route + method, dev header, deprecated-param rejection, JSON out
-├── service/StudentApplicationService       resolves "today", loads today's apps, paginates, attaches statistics
+├── service/StudentApplicationService       resolves "today", loads profile + today's apps, paginates, attaches statistics
 ├── service/StudentStatisticsService        reporting periods, weekday targets, percentages, Mon-Fri activity
-├── repository/StudentRepository            exists and not soft-deleted
+├── repository/StudentRepository            ONE query: validates the student (exists, not soft-deleted) and loads the profile
 ├── repository/StudentApplicationRepository today's applications query (no LIMIT/OFFSET/DATE())
 ├── repository/StudentStatisticsRepository  one aggregate query: month, today and each weekday count
+├── dto/StudentProfileDto                   profile + E.164 validation of the stored phone
 ├── dto/StudentApplicationDto, StudentApplicationsResponse
 ├── dto/StudentStatisticsDto, MonthlyProgressDto, TodayProgressDto, WeeklyActivityDto
 ├── config/AppConfig                        APP_TIMEZONE
@@ -59,6 +61,24 @@ weekday), never by counting the page list.
 
 Monthly and weekly statistics reflect real history even when there are no applications today.
 
+## Student profile
+
+`data.student` comes from the student's `users` row. The student check and the profile load are **one query**
+(`students JOIN users WHERE student_id = ? AND is_deleted = FALSE`), so a student who is missing or soft-deleted is a
+`404` before anything else is read, and nothing partial is ever returned. The query is filtered by the validated
+student id, so another student's profile can never be returned. Only five columns are read: `first_name`, `last_name`,
+`email`, `phone`, `phone_verified`.
+
+- **`phoneE164`** is `users.phone` **exactly as stored** (surrounding whitespace removed), or `null` when no phone is
+  stored. `users.phone` is a free-form `VARCHAR(16)` and nothing in the system enforces a format, so the API does not
+  validate or reformat it: `7135550123` stays `7135550123` (it is **not** turned into `+17135550123`), and
+  `(713) 555-0123` stays as is. The field name is kept for the frontend contract, but the value is E.164 only if it
+  was stored that way, so do not hand it to anything that needs E.164 (e.g. an SMS provider) without validating it. The
+  field is always in the JSON, even when `null`. A warning (student id only, never the number) is logged when it is
+  `null`. Stored numbers are never modified.
+- **`phoneVerified`** is `users.phone_verified` as stored (`TRUE` -> `true`, `FALSE` -> `false`). It is never inferred
+  from the number and never changed.
+
 ## Request
 
 | | |
@@ -75,6 +95,13 @@ Monthly and weekly statistics reflect real history even when there are no applic
   "data": {
     "studentId": 1000000002,
     "date": "2026-10-29",
+    "student": {
+      "firstName": "John",
+      "lastName": "Smith",
+      "email": "john.smith@example.com",
+      "phoneE164": "+17135550123",
+      "phoneVerified": false
+    },
     "totalApplications": 35,
     "pageSize": 20,
     "totalPages": 2,
@@ -106,7 +133,7 @@ Monthly and weekly statistics reflect real history even when there are no applic
 
 `data.date` and `data.totalApplications` are about **today**. Page 1 holds 20 applications (the last page may hold
 fewer); keys are strings `"1"`, `"2"`, ... With no applications today: `totalApplications: 0`, `totalPages: 0`,
-`"pages": {}`, `todayProgress.applied: 0`, but monthly and weekly still carry real counts.
+`"pages": {}`, `todayProgress.applied: 0`, but the profile and the monthly and weekly statistics are still returned.
 
 | Status | When |
 |---|---|
@@ -152,6 +179,25 @@ curl -i "http://localhost:3000/api/v1/student/applications" -H "X-Dev-Student-Id
 
 ### Verify against MySQL
 
+The profile (compare with `data.student`; `data.studentId` must be this same id):
+
+```sql
+SELECT
+    s.student_id,
+    u.first_name,
+    u.last_name,
+    u.email,
+    u.phone,
+    u.phone_verified
+FROM students s
+JOIN users u ON u.user_id = s.student_id
+WHERE s.student_id = 1000000002
+  AND u.is_deleted = FALSE;
+```
+
+`phoneE164` equals `u.phone` (whitespace trimmed), or `null` if `u.phone` is empty. `phoneVerified` is
+`u.phone_verified`.
+
 Today's applications (for `today` = 2026-10-29 Chicago, CDT; use the UTC bounds for the day you are testing):
 
 ```sql
@@ -172,13 +218,14 @@ WHERE student_id = 1000000002
 
 - The response carries `data.date` and `statistics.asOfDate` / `statistics.timezone`. The frontend must invalidate
   its cache when the reporting date changes, even if its own (~1 hour) cache has not expired.
-- Applications created during the cache window will not appear until the frontend refreshes.
-- The response contains private student data: do not configure shared/public caching for it.
+- Applications created during the cache window will not appear until the frontend refreshes, and neither will changes
+  to the student's profile.
+- The response contains private student data (name, email, phone): do not configure shared/public caching for it.
 
 ## Tests
 
 ```bash
-mvn test                     # unit tests (StudentLambda: 67)
+mvn test                     # unit tests (StudentLambda: 100)
 # Integration tests need a MySQL with hiremebot_db_V1 loaded. Run from the host with 127.0.0.1.
 # MySQL 8 caching_sha2 over a non-TLS connection may need DB_SSL_MODE=REQUIRED (or allow public key retrieval).
 RUN_DB_TESTS=true DB_HOST=127.0.0.1 DB_PORT=3306 DB_NAME=... DB_USERNAME=... DB_PASSWORD=... DB_SSL_MODE=REQUIRED \
@@ -197,5 +244,13 @@ them afterwards, touching nothing else. Point it at a development database.
 | Monthly count, weekday target (incl. Feb leap/non-leap, 20-23 weekday months) | statistics unit test |
 | Today count incl. weekends and above-target; percentages; remaining never negative | statistics unit test |
 | Weekly Mon-Fri, zero-fill, week spanning months/years, DST across weeks | statistics unit test |
+| Profile: first name, last name, email from MySQL | repository unit test (mapping) + integration against real rows |
+| Phone returned exactly as stored in any format (E.164, plain digits, formatted), never normalized; `null` only when empty | `StudentProfileDtoTest` + integration (stored value verified untouched) |
+| `phone_verified` TRUE -> `true`, FALSE -> `false`, never inferred | repository unit test + integration |
+| One student cannot retrieve another's profile | integration (service and direct repository query) |
+| Missing / soft-deleted student -> 404 with no data; profile + statistics with no applications today | service unit + integration |
+| Student validation and profile are one query (not two) | service unit test (`verifyNoMoreInteractions`) + repository SQL test |
+| JSON property names and order match the frontend contract; `phoneE164` present even when null | handler unit tests |
+| Applications ordering, pagination and statistics unchanged | all existing tests, unmodified assertions |
 | Timezone bucketing (evening app -> correct weekday), month exclusion | statistics integration test |
 | Missing header / invalid id -> 400; nonexistent or soft-deleted -> 404; DB down -> 503 | handler + service unit tests |

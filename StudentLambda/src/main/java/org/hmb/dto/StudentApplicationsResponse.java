@@ -9,13 +9,14 @@ import java.util.Map;
  * <p>{@code pages} maps 1-based page numbers to that page's applications, in insertion (= page) order. Jackson
  * writes the integer keys as JSON strings ({@code "1"}, {@code "2"}, ...). It is empty when there are no
  * applications. {@code date} and {@code totalApplications} are about <em>today</em>; broader counts live in
- * {@code statistics}.
+ * {@code statistics}. {@code student} is the requesting student's profile and is always present on a 200.
  */
 public record StudentApplicationsResponse(boolean success, Data data) {
 
     public record Data(
             long studentId,
             String date,
+            StudentProfileDto student,
             int totalApplications,
             int pageSize,
             int totalPages,

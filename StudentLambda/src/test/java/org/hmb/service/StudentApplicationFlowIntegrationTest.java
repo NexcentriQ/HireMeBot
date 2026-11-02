@@ -356,6 +356,162 @@ class StudentApplicationFlowIntegrationTest {
         assertEquals(5, data.get("statistics").get("weeklyActivity").get("days").size());
     }
 
+    // ---- student profile ------------------------------------------------------------------------------------
+
+    /** Overwrites the profile columns of a fixture student so a test controls exactly what the database holds. */
+    private static void setProfile(long studentId, String first, String last, String email, String phone,
+                                   boolean phoneVerified) throws SQLException {
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement(
+                     "UPDATE users SET first_name = ?, last_name = ?, email = ?, phone = ?, phone_verified = ? "
+                             + "WHERE user_id = ?")) {
+            ps.setString(1, first);
+            ps.setString(2, last);
+            ps.setString(3, email);
+            ps.setString(4, phone);
+            ps.setBoolean(5, phoneVerified);
+            ps.setLong(6, studentId);
+            ps.executeUpdate();
+        }
+    }
+
+    private static StudentApplicationsResponse.Data fetch(long studentId) {
+        return serviceOn(LocalDate.of(2026, 10, 29)).getApplications(studentId).data();
+    }
+
+    @Test
+    void returnsTheStudentsRealNameEmailAndPhoneFromMySql() throws SQLException {
+        Fixture f = fixture(1);
+        long student = f.studentIds().get(0);
+        String run = UUID.randomUUID().toString().replace("-", "").substring(0, 10);
+        setProfile(student, "John" + run, "Smith" + run, "john." + run + "@example.test", "+17135550123", false);
+
+        var profile = fetch(student).student();
+
+        assertEquals("John" + run, profile.firstName());
+        assertEquals("Smith" + run, profile.lastName());
+        assertEquals("john." + run + "@example.test", profile.email());
+        assertEquals("+17135550123", profile.phoneE164());
+        assertEquals(false, profile.phoneVerified());
+        assertEquals(student, fetch(student).studentId(), "the profile is for the same student as data.studentId");
+    }
+
+    @Test
+    void anInternationalE164NumberIsReturnedAsStored() throws SQLException {
+        Fixture f = fixture(1);
+        long student = f.studentIds().get(0);
+        setProfile(student, "Ravi" + shortId(), "Kumar", "ravi." + shortId() + "@example.test", "+919876543210", true);
+
+        assertEquals("+919876543210", fetch(student).student().phoneE164());
+    }
+
+    @ParameterizedTest(name = "stored phone \"{0}\" is returned as stored")
+    @CsvSource(value = {"9123456789", "7135550123", "(713) 555-0123", "+1 713 555 0123", "+0123456789", "12345"})
+    void aStoredPhoneInAnyFormatIsReturnedAsStoredAndNeverNormalized(String stored) throws SQLException {
+        Fixture f = fixture(1);
+        long student = f.studentIds().get(0);
+        setProfile(student, "Pat" + shortId(), "Lee", "pat." + shortId() + "@example.test", stored, false);
+
+        var profile = fetch(student).student();
+
+        assertEquals(stored, profile.phoneE164());
+        assertEquals("Pat", profile.firstName().substring(0, 3), "the rest of the profile is still returned");
+        // The database value itself is untouched.
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement("SELECT phone FROM users WHERE user_id = ?")) {
+            ps.setLong(1, student);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals(stored, rs.getString(1));
+            }
+        }
+    }
+
+    @Test
+    void phoneVerifiedFollowsTheDatabaseFlagBothWays() throws SQLException {
+        Fixture f = fixture(2);
+        long verified = f.studentIds().get(0);
+        long unverified = f.studentIds().get(1);
+        setProfile(verified, "Ver" + shortId(), "A", "ver." + shortId() + "@example.test", "+17135550123", true);
+        setProfile(unverified, "Unv" + shortId(), "B", "unv." + shortId() + "@example.test", "+17135550124", false);
+
+        assertEquals(true, fetch(verified).student().phoneVerified());
+        assertEquals(false, fetch(unverified).student().phoneVerified());
+    }
+
+    @Test
+    void aNewStudentIsNotVerifiedByDefault() throws SQLException {
+        Fixture f = fixture(1);   // fixture users are inserted without touching phone_verified (DEFAULT FALSE)
+
+        assertEquals(false, fetch(f.studentIds().get(0)).student().phoneVerified());
+    }
+
+    /** Student A can never receive Student B's profile, at the service or the repository query. */
+    @Test
+    void oneStudentCannotRetrieveAnotherStudentsProfile() throws SQLException {
+        Fixture f = fixture(2);
+        long a = f.studentIds().get(0);
+        long b = f.studentIds().get(1);
+        String run = shortId();
+        setProfile(a, "Alice" + run, "Adams", "alice." + run + "@example.test", "+17135550101", true);
+        setProfile(b, "Bob" + run, "Baker", "bob." + run + "@example.test", "+17135550202", false);
+
+        var profileA = fetch(a).student();
+        var profileB = fetch(b).student();
+
+        assertEquals("Alice" + run, profileA.firstName());
+        assertEquals("alice." + run + "@example.test", profileA.email());
+        assertEquals("+17135550101", profileA.phoneE164());
+        assertEquals("Bob" + run, profileB.firstName());
+        assertEquals("bob." + run + "@example.test", profileB.email());
+        assertEquals("+17135550202", profileB.phoneE164());
+
+        try (Connection c = dataSource.getConnection()) {
+            var direct = new StudentRepository().findActiveProfile(c, a).orElseThrow();
+            assertEquals("Alice" + run, direct.firstName());
+            assertTrue(!direct.email().contains("bob"), "the query for A must not return B's row");
+        }
+    }
+
+    @Test
+    void aStudentWithNoApplicationsTodayStillGetsTheirProfileAndRealStatistics() throws SQLException {
+        Fixture f = fixture(1);
+        long student = f.studentIds().get(0);
+        String run = shortId();
+        setProfile(student, "Quiet" + run, "Student", "quiet." + run + "@example.test", "+17135550123", false);
+        insertOnChicagoDate(f, student, LocalDate.of(2026, 10, 27), 4);   // earlier this week, nothing today
+
+        StudentApplicationsResponse.Data data = fetch(student);
+
+        assertEquals(0, data.totalApplications());
+        assertTrue(data.pages().isEmpty());
+        assertEquals("Quiet" + run, data.student().firstName());
+        assertEquals(4, data.statistics().monthlyProgress().applied());
+    }
+
+    @Test
+    void theProfileDoesNotChangeApplicationsOrderingOrPagination() throws SQLException {
+        Fixture f = fixture(1);
+        long student = f.studentIds().get(0);
+        setProfile(student, "Many" + shortId(), "Apps", "many." + shortId() + "@example.test", "+17135550123", false);
+        LocalDate today = LocalDate.of(2026, 10, 29);
+        for (int i = 0; i < 21; i++) {
+            insertApplication(f, student, chicagoTime(today, 9, 0).plusMinutes(i));
+        }
+
+        StudentApplicationsResponse.Data data = fetch(student);
+
+        assertEquals(21, data.totalApplications());
+        assertEquals(2, data.totalPages());
+        assertEquals(20, data.pages().get(1).size());
+        assertEquals(1, data.pages().get(2).size());
+        assertEquals(21, data.statistics().todayProgress().applied());
+    }
+
+    private static String shortId() {
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+    }
+
     // ---- student validation ---------------------------------------------------------------------------------
 
     @Test

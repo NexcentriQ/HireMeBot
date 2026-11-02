@@ -2,6 +2,7 @@ package org.hmb.service;
 
 import org.hmb.dto.StudentApplicationDto;
 import org.hmb.dto.StudentApplicationsResponse;
+import org.hmb.dto.StudentProfileDto;
 import org.hmb.dto.StudentStatisticsDto;
 import org.hmb.exception.ApiException;
 import org.hmb.repository.StudentApplicationRepository;
@@ -25,7 +26,8 @@ import java.util.Map;
 import javax.sql.DataSource;
 
 /**
- * Returns today's applications for a student, split into fixed-size pages, together with dashboard statistics.
+ * Returns a student's profile and today's applications (split into fixed-size pages), together with dashboard
+ * statistics.
  *
  * <p>The reporting date is always "today" in the reporting zone (default America/Chicago), taken from an
  * injectable {@link Clock}; there is no date parameter. The date is captured once per request so the applications
@@ -73,12 +75,14 @@ public class StudentApplicationService {
         LocalDate today = LocalDate.now(clock.withZone(zone));
         DayRange range = DayRange.of(today, zone);
 
+        StudentProfileDto profile;
         List<StudentApplicationDto> found;
         StudentStatisticsDto stats;
         try (Connection connection = dataSource.getConnection()) {
-            if (!students.isActiveStudent(connection, studentId)) {
-                throw ApiException.notFound("Student not found");
-            }
+            // One query both validates the student (exists, not soft-deleted) and loads the profile. If there is
+            // no profile we fail here, before reading anything else, so nothing partial is ever returned.
+            profile = students.findActiveProfile(connection, studentId)
+                    .orElseThrow(() -> ApiException.notFound("Student not found"));
             found = applications.findByStudentAndRange(connection, studentId, range.startUtc(), range.endUtc(), zone);
             stats = statistics.calculate(connection, studentId, today);
         } catch (ApiException e) {
@@ -91,10 +95,14 @@ public class StudentApplicationService {
             throw ApiException.internal(e);
         }
 
+        if (profile.phoneE164() == null) {
+            LOG.warn("Student {} has no phone number on file; returning phone as null", studentId);
+        }
+
         Map<Integer, List<StudentApplicationDto>> pages = paginate(found, PAGE_SIZE);
         LOG.info("Student {} has {} application(s) on {} ({} page(s))", studentId, found.size(), today, pages.size());
         return StudentApplicationsResponse.of(new StudentApplicationsResponse.Data(
-                studentId, today.toString(), found.size(), PAGE_SIZE, pages.size(), pages, stats));
+                studentId, today.toString(), profile, found.size(), PAGE_SIZE, pages.size(), pages, stats));
     }
 
     /**

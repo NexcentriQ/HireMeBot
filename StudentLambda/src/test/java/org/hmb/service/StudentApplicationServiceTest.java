@@ -2,6 +2,7 @@ package org.hmb.service;
 
 import org.hmb.dto.StudentApplicationDto;
 import org.hmb.dto.StudentApplicationsResponse;
+import org.hmb.dto.StudentProfileDto;
 import org.hmb.dto.StudentStatisticsDto;
 import org.hmb.exception.ApiException;
 import org.hmb.repository.StudentApplicationRepository;
@@ -27,6 +28,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -54,6 +56,8 @@ class StudentApplicationServiceTest {
 
     private static final StudentStatisticsDto STATS = new StudentStatisticsDto(
             "2026-10-25", "America/Chicago", null, null, null);
+    private static final StudentProfileDto PROFILE = StudentProfileDto.of(
+            "John", "Smith", "john.smith@example.com", "+17135550123", false);
 
     @Mock DataSource dataSource;
     @Mock Connection connection;
@@ -75,7 +79,7 @@ class StudentApplicationServiceTest {
 
     private void studentExistsWithApplications(List<StudentApplicationDto> apps) throws SQLException {
         when(dataSource.getConnection()).thenReturn(connection);
-        when(students.isActiveStudent(connection, STUDENT_ID)).thenReturn(true);
+        when(students.findActiveProfile(connection, STUDENT_ID)).thenReturn(Optional.of(PROFILE));
         when(applications.findByStudentAndRange(any(), anyLong(), any(), any(), any())).thenReturn(apps);
         when(statistics.calculate(any(), anyLong(), any())).thenReturn(STATS);
     }
@@ -136,6 +140,66 @@ class StudentApplicationServiceTest {
         assertSame(STATS, response.data().statistics());
     }
 
+    // ---- student profile ------------------------------------------------------------------------------------
+
+    @Test
+    void responseCarriesTheStudentsProfileFromTheSingleLookup() throws SQLException {
+        studentExistsWithApplications(applicationsNewestFirst(2));
+
+        StudentProfileDto profile = service.getApplications(STUDENT_ID).data().student();
+
+        assertSame(PROFILE, profile);
+        assertEquals("John", profile.firstName());
+        assertEquals("Smith", profile.lastName());
+        assertEquals("john.smith@example.com", profile.email());
+        assertEquals("+17135550123", profile.phoneE164());
+        assertEquals(false, profile.phoneVerified());
+        // One query both validates the student and supplies the profile: it is not looked up twice.
+        verify(students, org.mockito.Mockito.times(1)).findActiveProfile(connection, STUDENT_ID);
+        org.mockito.Mockito.verifyNoMoreInteractions(students);
+    }
+
+    @Test
+    void aStudentWithNoApplicationsTodayStillGetsTheirProfileAndStatistics() throws SQLException {
+        studentExistsWithApplications(List.of());
+
+        StudentApplicationsResponse.Data data = service.getApplications(STUDENT_ID).data();
+
+        assertEquals(0, data.totalApplications());
+        assertTrue(data.pages().isEmpty());
+        assertSame(PROFILE, data.student());
+        assertSame(STATS, data.statistics());
+    }
+
+    @Test
+    void aStoredPhoneInAnyFormatIsPassedThroughAsStored() throws SQLException {
+        StudentProfileDto plainDigits = StudentProfileDto.of("Jane", "Doe", "jane@example.test", "7135550123", true);
+        when(dataSource.getConnection()).thenReturn(connection);
+        when(students.findActiveProfile(connection, STUDENT_ID)).thenReturn(Optional.of(plainDigits));
+        when(applications.findByStudentAndRange(any(), anyLong(), any(), any(), any())).thenReturn(List.of());
+        when(statistics.calculate(any(), anyLong(), any())).thenReturn(STATS);
+
+        StudentProfileDto profile = service.getApplications(STUDENT_ID).data().student();
+
+        assertEquals("7135550123", profile.phoneE164());   // not reformatted, not given a +1
+        assertEquals(true, profile.phoneVerified());       // the flag is reported as stored
+        assertEquals("Jane", profile.firstName());
+    }
+
+    @Test
+    void aStudentWithNoPhoneOnFileStillGetsTheirProfile() throws SQLException {
+        StudentProfileDto noPhone = StudentProfileDto.of("Jane", "Doe", "jane@example.test", "", false);
+        when(dataSource.getConnection()).thenReturn(connection);
+        when(students.findActiveProfile(connection, STUDENT_ID)).thenReturn(Optional.of(noPhone));
+        when(applications.findByStudentAndRange(any(), anyLong(), any(), any(), any())).thenReturn(List.of());
+        when(statistics.calculate(any(), anyLong(), any())).thenReturn(STATS);
+
+        StudentProfileDto profile = service.getApplications(STUDENT_ID).data().student();
+
+        assertEquals(null, profile.phoneE164());
+        assertEquals("Jane", profile.firstName());
+    }
+
     @Test
     void statisticsRunOnTheSameConnectionForToday() throws SQLException {
         studentExistsWithApplications(List.of());
@@ -148,7 +212,7 @@ class StudentApplicationServiceTest {
     @Test
     void unknownOrSoftDeletedStudentIs404AndNothingElseRuns() throws SQLException {
         when(dataSource.getConnection()).thenReturn(connection);
-        when(students.isActiveStudent(connection, STUDENT_ID)).thenReturn(false);
+        when(students.findActiveProfile(connection, STUDENT_ID)).thenReturn(Optional.empty());
 
         ApiException e = assertThrows(ApiException.class, () -> service.getApplications(STUDENT_ID));
 
@@ -168,7 +232,7 @@ class StudentApplicationServiceTest {
     @Test
     void sqlErrorIs500AndDoesNotLeakDetails() throws SQLException {
         when(dataSource.getConnection()).thenReturn(connection);
-        when(students.isActiveStudent(connection, STUDENT_ID)).thenReturn(true);
+        when(students.findActiveProfile(connection, STUDENT_ID)).thenReturn(Optional.of(PROFILE));
         when(applications.findByStudentAndRange(any(), anyLong(), any(), any(), any()))
                 .thenThrow(new SQLException("Unknown column 'secret_col' in 'field list'", "42S22", 1054));
 
