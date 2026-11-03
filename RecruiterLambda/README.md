@@ -42,8 +42,11 @@ org.hmb
   and neither `users.is_deleted`) -> **403** if there is no match. The composite FK
   `fk_application_assignment (recruiter_id, student_id)` is a second line of defence: if the assignment is removed
   concurrently, MySQL error 1452 is mapped to **403**.
-- **Documents:** the resume (required) and cover letter (optional) must exist in `object_store_entries`, otherwise
-  **403**. They are linked through `application_documents` in the same transaction as the application.
+- **Documents:** the resume (required) and cover letter (optional) must **belong to the application's student and have the
+  matching `document_type`** (`RESUME` / `COVER_LETTER`) in `object_store_entries`, otherwise **403**. A missing object,
+  another student's object and a wrong-type object all get the same answer, so nothing about other students' documents
+  is revealed. They are linked through `application_documents` in the same transaction as the application. Resumes are
+  created by the document upload API (see `DocumentManagementLambda`).
 - **Questions:** optional (may be empty). If sent, every question/answer pair is validated and inserted into
   `application_questions` in the same transaction, so a failure there rolls back the application too.
 - `application_id`, `created_at`, `updated_at`, `applied_at` and `job_link_hash` come from the database;
@@ -52,8 +55,8 @@ org.hmb
 ### Schema limitations that affect this endpoint
 
 1. `is_deleted` is not enforced by any FK, so the soft-delete check lives in the assignment SQL.
-2. `object_store_entries.student_id` is not checked against the request's `studentId`; a recruiter could attach
-   another student's object. Intentionally not validated yet (decision pending).
+2. (Closed) `object_store_entries.student_id` and `document_type` are now checked against the request's `studentId` and
+   the document's role, so another student's object, or a resume used as a cover letter, can no longer be attached.
 3. Duplicate detection hashes the raw `job_link`: `.../1234567` and `.../1234567/` or a different query string are
    different links. The link is stored as given, not normalised.
 4. `UNIQUE (student_id)` on `recruiter_student_assignments` means a student has exactly one recruiter.
@@ -127,7 +130,9 @@ Errors use `{ "success": false, "error": "<CODE>", "message": "...", "details": 
 | 500 | anything else (details only in logs) |
 
 The test data in the database must match the IDs you send: a recruiter row, a student row, a row in
-`recruiter_student_assignments` linking them, and `object_store_entries` rows for the resume and cover letter.
+`recruiter_student_assignments` linking them, and `object_store_entries` rows **for that same student** with
+`document_type` `RESUME` for the resume and `COVER_LETTER` for the cover letter. This needs the
+`object_store_entries.document_type` column; without it the endpoint fails with a generic `500`.
 
 ## GET /api/v1/recruiter/students
 

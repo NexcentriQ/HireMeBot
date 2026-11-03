@@ -11,16 +11,28 @@
         <module>common</module>
         <module>RecruiterLambda</module>
         <module>StudentLambda</module>
+        <module>DocumentManagementLambda</module>
     </modules>
 
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- 2.57.8 is the newest release but its checksums jar is blocked by this network's security proxy (403);
+             2.57.7 is the previous patch release. Bump when the proxy allows it. -->
+        <aws.sdk.version>2.57.7</aws.sdk.version>
     </properties>
 
     <dependencyManagement>
         <dependencies>
+            <!-- AWS SDK for Java v2: one pinned release for every SDK artifact (used by DocumentManagementLambda). -->
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${aws.sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>com.amazonaws</groupId>
                 <artifactId>aws-lambda-java-core</artifactId>

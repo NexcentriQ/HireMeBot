@@ -1,17 +1,21 @@
 # HireMeBot API Reference
 
-Three endpoints, served by two Lambdas:
+Five endpoints, served by three Lambdas:
 
 | Endpoint | Purpose | Lambda |
 |---|---|---|
 | [`POST /api/v1/recruiter/applications`](#1-post-apiv1recruiterapplications) | A recruiter records a job application they already made for an assigned student | RecruiterLambda |
 | [`GET /api/v1/recruiter/students`](#2-get-apiv1recruiterstudents) | A recruiter lists their active assigned students (fills the Apply Job form's student dropdown) | RecruiterLambda |
 | [`GET /api/v1/student/applications`](#3-get-apiv1studentapplications) | A student's dashboard: today's recorded applications plus monthly/daily/weekly progress statistics | StudentLambda |
+| [`POST /api/v1/documents/upload-url`](#4-post-apiv1documentsupload-url) | A recruiter checks for a duplicate and gets a presigned S3 PUT URL for a student's resume | DocumentManagementLambda |
+| [`POST /api/v1/documents/register`](#5-post-apiv1documentsregister) | A recruiter registers the uploaded resume (after verification) and receives its `objectId` | DocumentManagementLambda |
 
 > **Status: development only.** Authentication is not implemented yet. Callers are identified by temporary
 > `X-Dev-*` headers that are **not authentication** and are accepted only when the server is started with the
 > matching flag. Do not expose these APIs publicly until Cognito/JWT replaces them (see
-> [Authentication](#authentication-development-only)).
+> [Authentication](#authentication-development-only)). The two document endpoints are stricter: they accept the
+> header only under `sam local`, so a deployed stack answers `403` to every document call until production
+> authentication exists.
 
 ---
 
@@ -67,6 +71,7 @@ Error bodies never contain SQL, stack traces, hostnames or credentials; the tech
 |---|---|---|
 | POST recruiter applications | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` |
 | GET recruiter students | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` (same flag as the POST) |
+| POST documents upload-url / register | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` **and** running under `sam local`; refused in every deployed environment |
 | GET student applications | `X-Dev-Student-Id: <student user_id>` | `ALLOW_DEV_STUDENT_HEADER=true` |
 
 The flag defaults to `false`. While it is `false`, the endpoint answers **403** to every request, whatever headers
@@ -121,8 +126,8 @@ the same job link twice for the same student and the second call is a `409`.
 | `application.jobLocation` | string | yes | not blank, max 255 characters |
 | `application.jobLink` | string | yes | absolute `http` or `https` URL with a host, max 1000 characters. Used to detect duplicates: the **exact** (trimmed) string is compared, so a trailing slash or a different query string counts as a different job |
 | `application.jobSource` | string | yes | not blank, max 100 characters |
-| `documents.resumeObjectId` | integer | yes | positive; must exist in the object store |
-| `documents.coverLetterObjectId` | integer | no | positive when present; must exist in the object store |
+| `documents.resumeObjectId` | integer | yes | positive; must be a **resume of this same student** (`object_store_entries` row with this `studentId` and type `RESUME`), such as one returned by [`register`](#5-post-apiv1documentsregister) |
+| `documents.coverLetterObjectId` | integer | no | positive when present; must be a **cover letter of this same student** (type `COVER_LETTER`) |
 | `questions` | array | no | omit or send `[]` for none; max 50 entries |
 | `questions[].question` | string | yes, per entry | not blank, max 5000 characters |
 | `questions[].answer` | string | yes, per entry | not blank, max 5000 characters |
@@ -134,7 +139,9 @@ Behavior to know about:
   and anything after the JSON document are rejected with `400`. In particular, `recruiterId` in the body is
   rejected: the recruiter comes only from the header.
 - `appliedAt` is not accepted; the server records the time of the call (UTC). `isViewed` starts as `false`.
-- The resume and cover-letter ids are only checked for existence, not for belonging to the student.
+- The resume and cover-letter ids must belong to the application's student and have the matching document type. A
+  missing object, another student's object and an object of the wrong type all get the **same** `403`, so nothing
+  about other students' documents is revealed. A resume cannot be attached as a cover letter or the reverse.
 - The application, its document link and its questions are saved in one transaction: either all of it is stored or none.
 
 ### Responses
@@ -173,8 +180,8 @@ before a malformed body, and a malformed body before field validation.
 | 9 | 400 | `BAD_REQUEST` | `Malformed or invalid JSON request body` | invalid JSON, a JSON array/string instead of an object, a wrong value type, or trailing content |
 | 10 | 400 | `VALIDATION_ERROR` | `Request validation failed` | one or more field rules failed; **all** problems are listed in `details` (see below) |
 | 11 | 403 | `FORBIDDEN` | `Recruiter is not assigned to this student` | no active assignment: the student is not assigned to this recruiter, either user does not exist or is soft-deleted, or the assignment was removed while the request ran |
-| 12 | 403 | `FORBIDDEN` | `Resume object does not exist` | `documents.resumeObjectId` not found |
-| 13 | 403 | `FORBIDDEN` | `Cover letter object does not exist` | `documents.coverLetterObjectId` was sent but not found |
+| 12 | 403 | `FORBIDDEN` | `Resume object does not exist` | `documents.resumeObjectId` is not a resume of this student: it does not exist, belongs to another student, or is not of type `RESUME` |
+| 13 | 403 | `FORBIDDEN` | `Cover letter object does not exist` | `documents.coverLetterObjectId` was sent but is not a cover letter of this student (missing, another student's, or the wrong type) |
 | 14 | 409 | `CONFLICT` | `An application for this student and job link already exists` | the student already has an application with this `jobLink`. Concurrent identical requests are safe: exactly one gets `201`, the rest get `409` |
 | 15 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; nothing was stored, so the request can be retried |
 | 16 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure; nothing was stored. Includes a server that is missing its database configuration |
@@ -571,6 +578,250 @@ curl -i "http://127.0.0.1:3000/api/v1/student/applications" \
 
 ---
 
+## Document upload (resumes): endpoints 4 and 5
+
+A recruiter uploads a student's resume **directly to a private S3 bucket**, then registers it. The file never passes
+through the API. Two API calls bracket one direct upload:
+
+```
+ 1. Browser: SHA-256 of the file's bytes (Web Crypto)
+ 2. POST /api/v1/documents/upload-url   -> ALREADY_EXISTS (reuse objectId)   or   UPLOAD_REQUIRED (+ URL, headers, token)
+ 3. Browser: PUT the file to the presigned URL, sending exactly the returned headers      (straight to S3)
+ 4. POST /api/v1/documents/register     -> objectId  (the document is now registered in MySQL)
+```
+
+The returned `objectId` is what [`POST /api/v1/recruiter/applications`](#1-post-apiv1recruiterapplications) takes as
+`documents.resumeObjectId`. Uploading a resume and attaching it to an application are separate operations; uploading
+never creates an application.
+
+**Rules that apply to both calls**
+
+- **Only `RESUME` is enabled.** `COVER_LETTER` exists in the model but is disabled (`400 DOCUMENT_TYPE_NOT_ENABLED`).
+- **Allowed files:** `.pdf` (`application/pdf`) and `.docx`
+  (`application/vnd.openxmlformats-officedocument.wordprocessingml.document`), at most **5 MB**. The extension and the
+  declared content type must agree.
+- **Global uniqueness by content.** The SHA-256 of the bytes is unique across the whole system. The same bytes can never
+  be registered twice, by anyone, under any document type. A document belongs to exactly one student and is never shared.
+- **Authorization.** The caller must be an active recruiter assigned to the student. The recruiter is the authenticated
+  identity, never a field in the body.
+- **Nothing is written to MySQL until the upload has been verified** (the `register` call).
+- Responses carry `Cache-Control: no-store`: they contain upload URLs and tokens, which are credentials. Never log them.
+
+> **Authentication for these two endpoints is local-development only.** The recruiter is identified by
+> `X-Dev-Recruiter-Id`, and the server accepts that header **only when it runs under `sam local`**. In any deployed
+> environment these endpoints answer `403 Recruiter authentication is not configured` to every request, whatever
+> headers are sent. **Production authentication (a validated Cognito/JWT identity mapped to a recruiter) is a
+> prerequisite before these APIs are exposed publicly.**
+
+---
+
+## 4. `POST /api/v1/documents/upload-url`
+
+Checks whether these bytes are already registered and, if not, returns a short-lived presigned S3 `PUT` URL. It writes
+nothing to MySQL or to S3.
+
+### Request
+
+**Headers:** `Content-Type: application/json`, `X-Dev-Recruiter-Id: <recruiter user_id>` (local development only).
+
+```json
+{
+  "studentId": 1000000005,
+  "documentType": "RESUME",
+  "fileName": "Akhil_Resume.pdf",
+  "contentType": "application/pdf",
+  "fileSize": 245760,
+  "checksum": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+}
+```
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `studentId` | integer | yes | positive; the recruiter must be assigned to this student |
+| `documentType` | string | yes | `RESUME` (enabled) or `COVER_LETTER` (disabled) |
+| `fileName` | string | yes | at most 255 characters; its extension (`pdf` or `docx`) selects the format. Used only to read the extension: it is not stored and never becomes part of the S3 key |
+| `contentType` | string | yes | must equal the format's type: `application/pdf` for `.pdf`; the long `...wordprocessingml.document` type for `.docx` |
+| `fileSize` | integer | yes | 1 to 5,242,880 bytes; the exact size of the file |
+| `checksum` | string | yes | SHA-256 of the file's bytes: 64 hexadecimal characters (upper case is accepted and lower-cased). **Not** a hash of the file name or path |
+
+The body is strict: unknown fields (including `recruiterId`), wrong types and trailing content are rejected with `400`.
+
+### Responses
+
+#### `200 OK`, `status: "UPLOAD_REQUIRED"`
+
+```json
+{
+  "success": true,
+  "status": "UPLOAD_REQUIRED",
+  "uploadRequired": true,
+  "objectKey": "students/1000000005/resumes/123e4567-e89b-12d3-a456-426614174000.pdf",
+  "uploadUrl": "https://<bucket>.s3.<region>.amazonaws.com/students/1000000005/resumes/123e...pdf?X-Amz-...",
+  "uploadToken": "<signed upload intent>",
+  "expiresIn": 300,
+  "requiredHeaders": {
+    "Content-Type": "application/pdf",
+    "x-amz-checksum-sha256": "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+    "x-amz-tagging": "doc-state=pending"
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `objectKey` | chosen by the server; pass it back unchanged to `register`. Never invent or alter it |
+| `uploadUrl` | presigned S3 `PUT` URL, valid for `expiresIn` seconds (300). A credential: never log it |
+| `uploadToken` | signed proof that this exact upload was authorized for this recruiter (valid 30 minutes). A credential: never log it. Pass it to `register` |
+| `requiredHeaders` | the headers to send **exactly** with the `PUT`. They are part of the signature: a missing or different value makes S3 reject the upload (`403 SignatureDoesNotMatch`). `x-amz-checksum-sha256` is the base64 form of your hex checksum, computed by the server: just echo it |
+
+**Performing the `PUT`:** `PUT <uploadUrl>` with `requiredHeaders` and the raw file bytes as the body. Do **not** send the
+application's JWT or any other `Authorization` header to S3, do not put AWS credentials in the browser, and do not set
+`Content-Length` (the browser sets it, and the signature requires it to equal `fileSize`). S3 itself rejects a body
+whose SHA-256 or size differs from what was authorized. Call `register` only after S3 returns `200`.
+
+#### `200 OK`, `status: "ALREADY_EXISTS"`
+
+```json
+{ "success": true, "status": "ALREADY_EXISTS", "uploadRequired": false, "objectId": 1000000001 }
+```
+
+The same student has already uploaded these exact bytes as the same type, and the file is still there. Do not upload
+again; use `objectId`. Suggested message: *"This resume has already been uploaded."*
+
+#### Error responses
+
+Checks run in this order and the first failure is returned. All use the standard error envelope.
+
+| # | Status | `error` | Cause |
+|---|---|---|---|
+| 1 | 404 | `NOT_FOUND` | path is not an endpoint of this API |
+| 2 | 405 | `METHOD_NOT_ALLOWED` | method is not `POST` (`Allow: POST`) |
+| 3 | 403 | `FORBIDDEN` (`Recruiter authentication is not configured`) | dev authentication is not permitted here: any deployed environment, or the flag is off |
+| 4 | 400 | `BAD_REQUEST` | `X-Dev-Recruiter-Id` missing or not a positive integer |
+| 5 | 400 | `BAD_REQUEST` | body missing, malformed JSON, wrong type, or contains an unknown field |
+| 6 | 400 | `DOCUMENT_TYPE_NOT_ENABLED` | the type is not enabled (`COVER_LETTER` in V1). Reported before other field errors |
+| 7 | 400 | `VALIDATION_ERROR` | a field rule failed; every problem is in `details`, e.g. `fileName must end with one of: pdf, docx`, `contentType must be application/pdf for a .pdf file`, `fileSize must be between 1 and 5242880 bytes`, `checksum must be a SHA-256 value: 64 hexadecimal characters` |
+| 8 | 403 | `FORBIDDEN` (`Recruiter does not exist or is not active`) | the caller is not an active recruiter (a student id, a manager id, a deleted or unknown user) |
+| 9 | 403 | `FORBIDDEN` (`Recruiter is not assigned to this student`) | not assigned, either user deleted, or the student does not exist |
+| 10 | 409 | `DUPLICATE_DOCUMENT` | these bytes are registered to **another student**, or to this student under **another document type**. The message is generic (`This document is already registered.`): it never names the other student, a key or an id |
+| 11 | 409 | `DOCUMENT_UNAVAILABLE` | these bytes are registered for this student but the stored file is missing. It cannot be re-uploaded (the checksum is unique). Contact support |
+| 12 | 503 | `SERVICE_UNAVAILABLE` | database or S3 temporarily unavailable; safe to retry |
+| 13 | 500 | `INTERNAL_ERROR` | anything else (cause only in the logs) |
+
+A **presigned URL that has expired** is not an error from this API: S3 answers the `PUT` with `403`. Call `upload-url`
+again for a fresh URL.
+
+### Example
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/api/v1/documents/upload-url \
+  -H "Content-Type: application/json" -H "X-Dev-Recruiter-Id: 1000000001" \
+  -d '{"studentId":1000000005,"documentType":"RESUME","fileName":"Akhil_Resume.pdf","contentType":"application/pdf","fileSize":245760,"checksum":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}'
+```
+
+---
+
+## 5. `POST /api/v1/documents/register`
+
+Called **after** the `PUT` to S3 succeeded. It verifies what S3 actually holds, then records the document in MySQL and
+returns its `objectId`. It is idempotent and safe to retry.
+
+### Request
+
+**Headers:** `Content-Type: application/json`, `X-Dev-Recruiter-Id: <recruiter user_id>` (local development only).
+
+```json
+{
+  "studentId": 1000000005,
+  "documentType": "RESUME",
+  "objectKey": "students/1000000005/resumes/123e4567-e89b-12d3-a456-426614174000.pdf",
+  "checksum": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  "uploadToken": "<the uploadToken from upload-url>"
+}
+```
+
+Every field must be exactly what `upload-url` authorized. The `checksum` in this body is **never trusted by itself**: it
+is compared with the signed token and with the SHA-256 that S3 recorded for the object.
+
+### What is verified before anything is stored
+
+1. The caller is an active recruiter, still assigned to the student.
+2. The token's signature, expiry and recruiter; and that its student, type, key and checksum equal the request.
+3. The key is exactly a server-generated key for this student and type (nothing client-chosen is accepted).
+4. S3 `HeadObject`: the object exists, its size and content type equal what was authorized, and the SHA-256 S3 stored
+   (validated against the bytes at upload time) equals the authorized checksum.
+5. Basic format check, see *Limitations* below.
+
+Only then is the row inserted. The database `UNIQUE(hashed_value)` constraint is the final arbiter of duplicates, so two
+simultaneous registrations of the same bytes can never both succeed.
+
+### Responses
+
+#### `201 Created` (registered by this call) or `200 OK` (already registered)
+
+```json
+{
+  "success": true,
+  "status": "SUCCESS",
+  "objectId": 1000000002,
+  "studentId": 1000000005,
+  "documentType": "RESUME",
+  "message": "Resume uploaded successfully"
+}
+```
+
+`200` has the same body: it means the document was already registered, so a retry (for example after a timeout or a
+lost response) returns the **same** `objectId` and creates nothing new. The same bytes already registered for the same
+student also return that existing `objectId`.
+
+#### Error responses
+
+| # | Status | `error` | Cause |
+|---|---|---|---|
+| 1-5 | 404 / 405 / 403 / 400 | as for `upload-url` | route, method, dev-auth, header, body |
+| 6 | 400 | `DOCUMENT_TYPE_NOT_ENABLED` / `VALIDATION_ERROR` | type disabled, or a field is missing or malformed (`details` lists them) |
+| 7 | 403 | `FORBIDDEN` | not an active recruiter, or not assigned to the student |
+| 8 | 400 | `UPLOAD_TOKEN_EXPIRED` | the token (30 minutes) expired: request a new upload URL and upload again |
+| 9 | 403 | `UPLOAD_TOKEN_INVALID` | token malformed, forged, issued to another recruiter, bound to different values than the request, or the key is not the one the server issued |
+| 10 | 409 | `DUPLICATE_DOCUMENT` | these bytes belong to another student or another document type |
+| 11 | 409 | `DOCUMENT_UNAVAILABLE` | already registered, but the stored file is missing. Contact support |
+| 12 | 400 | `UPLOAD_NOT_FOUND` | no object at that key: the `PUT` did not happen or failed. Request a new upload URL and upload again |
+| 13 | 400 | `UPLOAD_VERIFICATION_FAILED` | S3's object does not match what was authorized (size, content type or checksum). Upload again |
+| 14 | 400 | `INVALID_FILE_FORMAT` | the file does not look like a valid PDF or DOCX (see Limitations) |
+| 15 | 503 | `SERVICE_UNAVAILABLE` | database or S3 temporarily unavailable; **retry the same request** |
+| 16 | 500 | `INTERNAL_ERROR` | anything else (cause only in the logs) |
+
+**Retrying `register`:** keep `objectKey` and `uploadToken` until you receive a success. On `503` or a network error,
+send the identical request again: it is idempotent. Do not call `upload-url` again for the same file in that case; the
+bytes are already in S3. Only when the token has expired (`UPLOAD_TOKEN_EXPIRED`) or the object is missing do you start
+over from `upload-url`.
+
+### Limitations of the file checks (read this before relying on them)
+
+The format check is deliberately **basic**: it reads only the first few bytes and the tail of the file (two small ranged
+reads), never the whole file.
+
+- **PDF:** starts with `%PDF-` and contains `%%EOF` in the last 1 KB (catches truncated uploads).
+- **DOCX:** starts with the zip signature `PK 03 04` and contains the zip end-of-central-directory record in the last
+  ~64 KB (catches truncated or non-zip files).
+
+Magic bytes and trailer markers are **trivially forged** and prove neither that a file is valid nor that it is safe. Any
+complete zip (an XLSX, a JAR) passes the DOCX check, and a file with a PDF header can still contain active content or
+fail to open. **There is no malware scanning.** Registered documents must be treated as untrusted. A scanner (for
+example GuardDuty Malware Protection for S3 or ClamAV) and safe-serving rules (`Content-Disposition: attachment`, no
+inline rendering) are prerequisites before any download or preview feature is built. The checksum proves only that the
+stored bytes are the bytes the browser hashed; it says nothing about their content.
+
+### Example
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/api/v1/documents/register \
+  -H "Content-Type: application/json" -H "X-Dev-Recruiter-Id: 1000000001" \
+  -d '{"studentId":1000000005,"documentType":"RESUME","objectKey":"<objectKey>","checksum":"<sha256>","uploadToken":"<uploadToken>"}'
+```
+
+---
+
 ## Status code summary
 
 | Status | POST recruiter applications | GET recruiter students | GET student applications |
@@ -584,6 +835,10 @@ curl -i "http://127.0.0.1:3000/api/v1/student/applications" \
 | **409** Conflict | duplicate application for this student and job link | not used | not used |
 | **500** Internal Server Error | unexpected failure | unexpected failure | unexpected failure |
 | **503** Service Unavailable | database temporarily unreachable (retry) | database temporarily unreachable (retry) | database temporarily unreachable (retry) |
+
+The two document endpoints share these codes (`200` / `201` / `400` / `403` / `404` / `405` / `409` / `500` / `503`), with
+the specific `error` values listed in their own sections above; `register` returns `201` when it created the document
+and `200` when it was already registered.
 
 Retry guidance: `503` is transient and safe to retry for every endpoint (nothing was stored on a failed `POST`).
 Do not blindly retry `400`, `403`, `404`, `405` or `409`; they will fail the same way until the request or the data
@@ -602,7 +857,10 @@ generic failure.
 
 ## Not implemented yet
 
-- Authentication and authorization (Cognito/JWT); the `X-Dev-*` headers are a stand-in and will be removed.
+- Authentication and authorization (Cognito/JWT); the `X-Dev-*` headers are a stand-in and will be removed. This is a
+  hard prerequisite for exposing any endpoint, and for the document endpoints it is the only way they can work once
+  deployed.
 - Pagination controls (`page`, `limit`) on the GET: it intentionally returns every page at once.
-- Rate limiting, CORS configuration and API versioning beyond the `/v1` path prefix.
+- Rate limiting, and API versioning beyond the `/v1` path prefix. (CORS is configured for one explicit portal origin.)
+- Reading, downloading and deleting documents, cover-letter upload, and malware scanning of uploads.
 - A deployed base URL.

@@ -56,7 +56,7 @@ class ApplicationServiceTest {
 
     private void assignedAndDocumentsExist() throws SQLException {
         when(assignments.isActiveAssignment(connection, TestData.RECRUITER_ID, TestData.STUDENT_ID)).thenReturn(true);
-        when(documents.objectExists(any(), anyLong())).thenReturn(true);
+        when(documents.existsForStudent(any(), anyLong(), anyLong(), any())).thenReturn(true);
     }
 
     private ApiException failure() {
@@ -95,10 +95,74 @@ class ApplicationServiceTest {
     void unknownResumeObjectIs403() throws SQLException {
         connectionAvailable();
         when(assignments.isActiveAssignment(connection, TestData.RECRUITER_ID, TestData.STUDENT_ID)).thenReturn(true);
-        when(documents.objectExists(connection, TestData.RESUME_ID)).thenReturn(false);
+        when(documents.existsForStudent(connection, TestData.RESUME_ID, TestData.STUDENT_ID, DocumentRepository.Kind.RESUME))
+                .thenReturn(false);
 
         assertEquals(403, failure().getStatusCode());
         verifyNoInteractions(applications);
+    }
+
+    // ---- the documents must belong to the application's student and have the right type -----------------------
+
+    @Test
+    void theResumeAndCoverLetterAreCheckedAgainstTheApplicationsStudentAndTheirTypes() throws SQLException {
+        connectionAvailable();
+        assignedAndDocumentsExist();
+        when(applications.insert(eq(connection), eq(TestData.RECRUITER_ID), any())).thenReturn(NEW_APPLICATION_ID);
+
+        service.createApplication(TestData.RECRUITER_ID, TestData.validRequest());
+
+        verify(documents).existsForStudent(connection, TestData.RESUME_ID, TestData.STUDENT_ID,
+                DocumentRepository.Kind.RESUME);
+        verify(documents).existsForStudent(connection, TestData.COVER_LETTER_ID, TestData.STUDENT_ID,
+                DocumentRepository.Kind.COVER_LETTER);
+    }
+
+    /** A resume that is another student's, or is not a RESUME, fails the same check as a missing one. */
+    @Test
+    void aResumeThatBelongsToAnotherStudentOrHasTheWrongTypeIsRejectedWithTheSameAnswerAsAMissingOne() throws SQLException {
+        connectionAvailable();
+        assignedAndDocumentsExist();
+        when(documents.existsForStudent(connection, TestData.RESUME_ID, TestData.STUDENT_ID, DocumentRepository.Kind.RESUME))
+                .thenReturn(false);
+
+        ApiException e = failure();
+
+        assertEquals(403, e.getStatusCode());
+        assertEquals("Resume object does not exist", e.getMessage());   // does not reveal that the object exists
+        verify(connection).rollback();
+        verifyNoInteractions(applications);
+        verify(documents, never()).insert(any(), anyLong(), anyLong(), any());
+    }
+
+    @Test
+    void aCoverLetterThatIsNotTheStudentsCoverLetterIsRejected() throws SQLException {
+        connectionAvailable();
+        assignedAndDocumentsExist();
+        when(documents.existsForStudent(connection, TestData.COVER_LETTER_ID, TestData.STUDENT_ID,
+                DocumentRepository.Kind.COVER_LETTER)).thenReturn(false);
+
+        ApiException e = failure();
+
+        assertEquals(403, e.getStatusCode());
+        assertEquals("Cover letter object does not exist", e.getMessage());
+        verifyNoInteractions(applications);
+    }
+
+    @Test
+    void withoutACoverLetterOnlyTheResumeIsChecked() throws SQLException {
+        connectionAvailable();
+        assignedAndDocumentsExist();
+        when(applications.insert(eq(connection), eq(TestData.RECRUITER_ID), any())).thenReturn(NEW_APPLICATION_ID);
+        var base = TestData.validRequest();
+        var resumeOnly = new org.hmb.dto.RecruiterRequest(base.studentId(), base.application(),
+                new org.hmb.dto.RecruiterRequest.Documents(TestData.RESUME_ID, null), base.questions());
+
+        service.createApplication(TestData.RECRUITER_ID, resumeOnly);
+
+        verify(documents).existsForStudent(connection, TestData.RESUME_ID, TestData.STUDENT_ID,
+                DocumentRepository.Kind.RESUME);
+        verify(documents, never()).existsForStudent(any(), anyLong(), anyLong(), eq(DocumentRepository.Kind.COVER_LETTER));
     }
 
     @Test

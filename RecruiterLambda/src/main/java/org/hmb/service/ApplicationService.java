@@ -120,12 +120,15 @@ public class ApplicationService {
             throw ApiException.forbidden("Recruiter is not assigned to this student");
         }
 
+        // The documents must belong to this application's student and have the right type. A missing object, another
+        // student's object and a wrong-type object all get the same answer, so nothing about other students leaks.
         RecruiterRequest.Documents docs = request.documents();
-        if (!documents.objectExists(connection, docs.resumeObjectId())) {
+        if (!documents.existsForStudent(connection, docs.resumeObjectId(), studentId, DocumentRepository.Kind.RESUME)) {
             throw ApiException.forbidden("Resume object does not exist");
         }
         Long coverLetterId = docs.coverLetterObjectId();
-        if (coverLetterId != null && !documents.objectExists(connection, coverLetterId)) {
+        if (coverLetterId != null
+                && !documents.existsForStudent(connection, coverLetterId, studentId, DocumentRepository.Kind.COVER_LETTER)) {
             throw ApiException.forbidden("Cover letter object does not exist");
         }
 

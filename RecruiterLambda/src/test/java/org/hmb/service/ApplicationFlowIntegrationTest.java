@@ -120,6 +120,62 @@ class ApplicationFlowIntegrationTest {
         assertEquals(0, applicationCount(f));
     }
 
+    // ---- documents must belong to the application's student and have the right type ----------------------------
+
+    private static RecruiterRequest requestWithDocuments(Fixture student, long resumeId, Long coverLetterId) {
+        return new RecruiterRequest(
+                student.studentId(),
+                new RecruiterRequest.Application("Integration Test Engineer", "Test Co", "Remote", uniqueLink(), "IT"),
+                new RecruiterRequest.Documents(resumeId, coverLetterId),
+                List.of());
+    }
+
+    @Test
+    void anotherStudentsResumeCannotBeAttached() throws SQLException {
+        Fixture mine = fixture(true);
+        Fixture other = fixture(true);   // a different student with their own resume
+
+        ApiException e = assertThrows(ApiException.class, () -> service.createApplication(
+                mine.recruiterId(), requestWithDocuments(mine, other.resumeId(), null)));
+
+        assertEquals(403, e.getStatusCode());
+        assertEquals("Resume object does not exist", e.getMessage());   // does not reveal that it exists
+        assertEquals(0, applicationCount(mine));
+    }
+
+    @Test
+    void aCoverLetterCannotBeAttachedAsTheResume() throws SQLException {
+        Fixture f = fixture(true);
+
+        ApiException e = assertThrows(ApiException.class, () -> service.createApplication(
+                f.recruiterId(), requestWithDocuments(f, f.coverLetterId(), null)));
+
+        assertEquals(403, e.getStatusCode());
+        assertEquals(0, applicationCount(f));
+    }
+
+    @Test
+    void aResumeCannotBeAttachedAsTheCoverLetter() throws SQLException {
+        Fixture f = fixture(true);
+
+        ApiException e = assertThrows(ApiException.class, () -> service.createApplication(
+                f.recruiterId(), requestWithDocuments(f, f.resumeId(), f.resumeId())));
+
+        assertEquals(403, e.getStatusCode());
+        assertEquals("Cover letter object does not exist", e.getMessage());
+        assertEquals(0, applicationCount(f));
+    }
+
+    @Test
+    void theStudentsOwnResumeAndNoCoverLetterIsAccepted() throws SQLException {
+        Fixture f = fixture(true);
+
+        var response = service.createApplication(f.recruiterId(), requestWithDocuments(f, f.resumeId(), null));
+
+        assertTrue(response.success());
+        assertEquals(1, applicationCount(f));
+    }
+
     @Test
     void duplicateJobLinkIsConflict() throws SQLException {
         Fixture f = fixture(true);
@@ -186,8 +242,8 @@ class ApplicationFlowIntegrationTest {
                 execute(c, "INSERT INTO recruiter_student_assignments (recruiter_id, student_id, assigned_by) VALUES (?, ?, ?)",
                         recruiter, student, manager);
             }
-            long resume = insertObject(c, student);
-            long cover = insertObject(c, student);
+            long resume = insertObject(c, student, "RESUME");
+            long cover = insertObject(c, student, "COVER_LETTER");
             Fixture f = new Fixture(manager, recruiter, student, resume, cover);
             created.add(f);
             return f;
@@ -222,15 +278,17 @@ class ApplicationFlowIntegrationTest {
         }
     }
 
-    private static long insertObject(Connection c, long studentId) throws SQLException {
+    /** @param documentType {@code RESUME} or {@code COVER_LETTER}, as in {@code object_store_entries.document_type} */
+    private static long insertObject(Connection c, long studentId, String documentType) throws SQLException {
         String key = "it/" + UUID.randomUUID();
         String hash = (UUID.randomUUID().toString() + UUID.randomUUID()).replace("-", "");
         try (PreparedStatement ps = c.prepareStatement(
-                "INSERT INTO object_store_entries (student_id, object_key, hashed_value) VALUES (?, ?, ?)",
+                "INSERT INTO object_store_entries (student_id, document_type, object_key, hashed_value) VALUES (?, ?, ?, ?)",
                 Statement.RETURN_GENERATED_KEYS)) {
             ps.setLong(1, studentId);
-            ps.setString(2, key);
-            ps.setString(3, hash);
+            ps.setString(2, documentType);
+            ps.setString(3, key);
+            ps.setString(4, hash);
             ps.executeUpdate();
             return generatedKey(ps);
         }
