@@ -131,7 +131,7 @@ class DocumentRepositoryTest {
     }
 
     @Test
-    void theReconcilerQueryIsAKeysetScanOfRecentRowsOrderedById() throws SQLException {
+    void theRecentRowsQueryIsAKeysetScanOrderedById() throws SQLException {
         stubRow(7L, 5L, "RESUME", "k", Fixtures.SHA256_HEX);
         LocalDateTime since = LocalDateTime.of(2026, 10, 29, 12, 0);
 

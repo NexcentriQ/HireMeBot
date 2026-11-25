@@ -120,6 +120,38 @@ class ApplicationFlowIntegrationTest {
         assertEquals(0, applicationCount(f));
     }
 
+    /**
+     * POST /recruiter/applications only checks the assignment, so the recruiter's account status must be part of that
+     * check: a PENDING (not yet approved) or SUSPENDED recruiter records nothing, an approved one does.
+     */
+    @Test
+    void aPendingRecruiterIsForbiddenUntilApproved() throws SQLException {
+        Fixture f = fixture(true);
+        setAccountStatus(f.recruiterId(), "PENDING");
+
+        ApiException e = assertThrows(ApiException.class,
+                () -> service.createApplication(f.recruiterId(), requestFor(f, uniqueLink())));
+
+        assertEquals(403, e.getStatusCode());
+        assertEquals(0, applicationCount(f));
+
+        setAccountStatus(f.recruiterId(), "ACTIVE");   // what the manual approval does
+        assertTrue(service.createApplication(f.recruiterId(), requestFor(f, uniqueLink())).success());
+        assertEquals(1, applicationCount(f));
+    }
+
+    @Test
+    void aSuspendedRecruiterIsForbidden() throws SQLException {
+        Fixture f = fixture(true);
+        setAccountStatus(f.recruiterId(), "SUSPENDED");
+
+        ApiException e = assertThrows(ApiException.class,
+                () -> service.createApplication(f.recruiterId(), requestFor(f, uniqueLink())));
+
+        assertEquals(403, e.getStatusCode());
+        assertEquals(0, applicationCount(f));
+    }
+
     // ---- documents must belong to the application's student and have the right type ----------------------------
 
     private static RecruiterRequest requestWithDocuments(Fixture student, long resumeId, Long coverLetterId) {
@@ -259,6 +291,15 @@ class ApplicationFlowIntegrationTest {
                         new RecruiterRequest.Question("Expected salary?", "$110,000")));
     }
 
+    private void setAccountStatus(long userId, String status) throws SQLException {
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement("UPDATE users SET account_status = ? WHERE user_id = ?")) {
+            ps.setString(1, status);
+            ps.setLong(2, userId);
+            assertEquals(1, ps.executeUpdate());
+        }
+    }
+
     private static String uniqueLink() {
         return "https://example.test/jobs/" + UUID.randomUUID();
     }
@@ -267,7 +308,9 @@ class ApplicationFlowIntegrationTest {
         String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         String phone = "9" + (100000000 + ThreadLocalRandom.current().nextInt(900000000));
         try (PreparedStatement ps = c.prepareStatement(
-                "INSERT INTO users (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)",
+                // The schema default is PENDING (an unapproved recruiter); the fixtures are approved (ACTIVE) users.
+                "INSERT INTO users (first_name, last_name, email, phone, account_status) "
+                        + "VALUES (?, ?, ?, ?, 'ACTIVE')",
                 Statement.RETURN_GENERATED_KEYS)) {
             ps.setString(1, "it" + suffix);
             ps.setString(2, "user" + suffix);

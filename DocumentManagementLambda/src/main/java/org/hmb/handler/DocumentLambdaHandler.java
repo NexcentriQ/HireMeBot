@@ -16,9 +16,10 @@ import org.hmb.dto.RegisterRequest;
 import org.hmb.dto.UploadUrlRequest;
 import org.hmb.exception.ApiException;
 import org.hmb.exception.ErrorResponse;
+import org.hmb.logging.RequestIds;
 import org.hmb.repository.DocumentRepository;
 import org.hmb.repository.RecruiterAccessRepository;
-import org.hmb.security.DevAuth;
+import org.hmb.security.RecruiterAuthenticator;
 import org.hmb.security.SigningSecretProvider;
 import org.hmb.security.UploadTokenService;
 import org.hmb.service.DocumentUploadService;
@@ -43,15 +44,16 @@ import java.util.function.Supplier;
  * Routes are matched on path and method. Responses carry {@code Cache-Control: no-store}: they hold upload URLs and
  * tokens, which are credentials and must never be logged or cached.
  *
- * <p><b>Authentication is development-only today.</b> The recruiter is identified by {@code X-Dev-Recruiter-Id}, which
- * is honoured only under {@code sam local} (see {@link DevAuth}). In a deployed Lambda every call is therefore
- * answered with 403 until production authentication exists. <b>Production authentication (a validated Cognito/JWT
- * identity mapped to a {@code recruiters.recruiter_id}) is a prerequisite before these APIs are exposed publicly</b>;
- * it replaces only {@link #resolveRecruiter}.
+ * <p><b>Authentication.</b> The acting recruiter comes only from the verified Cognito <em>access token</em>
+ * ({@code Authorization: Bearer ...}), resolved to an approved internal recruiter by {@link RecruiterAuthenticator};
+ * nothing the client sends (a recruiter id, a user id, an email) can pick the actor. The service then checks, with that
+ * id, that the recruiter is active and assigned to the student, and registers objects under that student only.
+ *
+ * <p>The {@code X-Dev-Recruiter-Id} header is a local-only fallback: it is consulted only when the request carries no
+ * {@code Authorization} header at all <em>and</em> {@code ALLOW_DEV_RECRUITER_HEADER=true} under {@code sam local}
+ * ({@link org.hmb.security.DevAuth}). A token, valid or not, always wins, and a deployed stack ignores the header.
  */
 public class DocumentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse> {
-
-    static final String DEV_RECRUITER_HEADER = "X-Dev-Recruiter-Id";
 
     /** The routes this Lambda serves. A path has exactly one allowed method. */
     enum Route {
@@ -86,27 +88,51 @@ public class DocumentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEve
             .build();
 
     private static volatile DocumentUploadService defaultService;
+    private static volatile RecruiterAuthenticator defaultAuthenticator;
 
     private final Supplier<DocumentUploadService> serviceSupplier;
-    private final boolean devAuthPermitted;
+    private final Supplier<RecruiterAuthenticator> authenticatorSupplier;
 
     /** Used by the Lambda runtime. Resources are created lazily and reused while the environment is warm. */
     public DocumentLambdaHandler() {
-        this(DocumentLambdaHandler::defaultService, DevAuth.permitted(System.getenv()));
+        this(DocumentLambdaHandler::defaultService, DocumentLambdaHandler::defaultAuthenticator);
     }
 
     /**
-     * For tests.
+     * For tests of the <em>local header-only</em> path: no token verification and no database for authentication.
      *
-     * @param devAuthPermitted whether the dev recruiter header may identify a caller (see {@link DevAuth#permitted})
+     * @param devAuthPermitted whether the dev recruiter header may identify a caller (a request that carries an
+     *                         {@code Authorization} header is refused with 401 in this mode)
      */
     public DocumentLambdaHandler(DocumentUploadService service, boolean devAuthPermitted) {
-        this(() -> service, devAuthPermitted);
+        this(service, RecruiterAuthenticator.devHeaderOnly(devAuthPermitted));
     }
 
-    private DocumentLambdaHandler(Supplier<DocumentUploadService> serviceSupplier, boolean devAuthPermitted) {
+    /** For tests: a fully wired authenticator (token verification, account lookup, dev-header gate). */
+    public DocumentLambdaHandler(DocumentUploadService service, RecruiterAuthenticator authenticator) {
+        this(() -> service, () -> authenticator);
+    }
+
+    private DocumentLambdaHandler(Supplier<DocumentUploadService> serviceSupplier,
+                                  Supplier<RecruiterAuthenticator> authenticatorSupplier) {
         this.serviceSupplier = serviceSupplier;
-        this.devAuthPermitted = devAuthPermitted;
+        this.authenticatorSupplier = authenticatorSupplier;
+    }
+
+    /** Built from the environment ({@code COGNITO_*}, the dev-header gate) on first use; a bad setting fails closed. */
+    private static RecruiterAuthenticator defaultAuthenticator() {
+        RecruiterAuthenticator local = defaultAuthenticator;
+        if (local == null) {
+            synchronized (DocumentLambdaHandler.class) {
+                local = defaultAuthenticator;
+                if (local == null) {
+                    local = RecruiterAuthenticator.fromEnvironment(System.getenv(), DatabaseConfig.getDataSource(),
+                            Clock.systemUTC());
+                    defaultAuthenticator = local;
+                }
+            }
+        }
+        return local;
     }
 
     private static DocumentUploadService defaultService() {
@@ -130,11 +156,18 @@ public class DocumentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEve
 
     @Override
     public APIGatewayV2HTTPResponse handleRequest(APIGatewayV2HTTPEvent event, Context context) {
+        String requestId = RequestIds.of(
+                event.getRequestContext() == null ? null : event.getRequestContext().getRequestId(),
+                context == null ? null : context.getAwsRequestId());
+        long started = System.nanoTime();
+        Route route = null;
         try {
-            Route route = resolveRoute(event);
-            long recruiterId = resolveRecruiter(event);
+            route = resolveRoute(event);
+            // The only source of the acting recruiter: the verified token (or, local only, the header when no token).
+            long recruiterId = authenticatorSupplier.get()
+                    .authenticate(event.getHeaders(), authorizerClaims(event)).recruiterId();
 
-            return switch (route) {
+            APIGatewayV2HTTPResponse response = switch (route) {
                 case UPLOAD_URL -> json(200, serviceSupplier.get()
                         .requestUploadUrl(parseBody(event, UploadUrlRequest.class), recruiterId), Map.of());
                 case REGISTER -> {
@@ -143,12 +176,36 @@ public class DocumentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEve
                     yield json(outcome.created() ? 201 : 200, outcome.body(), Map.of());
                 }
             };
+            log(route, response.getStatusCode(), "OK", started, requestId);
+            return response;
         } catch (ApiException e) {
+            log(route, e.getStatusCode(), e.getErrorCode(), started, requestId);
             Map<String, String> extra = e.getStatusCode() == 405 ? Map.of("Allow", allowedMethod(event)) : Map.of();
             return json(e.getStatusCode(), ErrorResponse.from(e), extra);
         } catch (Exception e) {
-            LOG.error("Unhandled error", e);
+            LOG.error("Unhandled error [requestId={}]", requestId, e);
             return json(500, ErrorResponse.from(ApiException.internal(e)), Map.of());
+        }
+    }
+
+    /** The claims of API Gateway's JWT authorizer when it ran (deployed); empty under {@code sam local}. */
+    private static Map<String, String> authorizerClaims(APIGatewayV2HTTPEvent event) {
+        var context = event.getRequestContext();
+        if (context == null || context.getAuthorizer() == null || context.getAuthorizer().getJwt() == null
+                || context.getAuthorizer().getJwt().getClaims() == null) {
+            return Map.of();
+        }
+        return context.getAuthorizer().getJwt().getClaims();
+    }
+
+    /** One line per request: method, path, outcome, time and request id. Never headers, bodies, URLs or tokens. */
+    private static void log(Route route, int status, String outcome, long started, String requestId) {
+        long millis = (System.nanoTime() - started) / 1_000_000;
+        String target = route == null ? "(unmatched route)" : route.method + " " + route.path;
+        if (status >= 500) {
+            LOG.error("{} -> {} {} in {} ms [requestId={}]", target, status, outcome, millis, requestId);
+        } else {
+            LOG.info("{} -> {} {} in {} ms [requestId={}]", target, status, outcome, millis, requestId);
         }
     }
 
@@ -185,37 +242,6 @@ public class DocumentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEve
             return event.getRequestContext().getHttp().getMethod();
         }
         return null;
-    }
-
-    /**
-     * Identifies the caller. This is the one place that changes when production authentication (a validated
-     * Cognito/JWT identity mapped to a recruiter id) replaces the development header.
-     *
-     * @throws ApiException 403 when dev authentication is not permitted here (any deployed environment),
-     *                      400 when the header is missing or invalid
-     */
-    private long resolveRecruiter(APIGatewayV2HTTPEvent event) {
-        if (!devAuthPermitted) {
-            // Fail closed: a plain header must never identify a recruiter outside local development.
-            throw ApiException.forbidden("Recruiter authentication is not configured");
-        }
-        Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        if (event.getHeaders() != null) {
-            headers.putAll(event.getHeaders());
-        }
-        String raw = headers.get(DEV_RECRUITER_HEADER);
-        if (raw == null || raw.isBlank()) {
-            throw ApiException.badRequest("Missing required header " + DEV_RECRUITER_HEADER);
-        }
-        try {
-            long id = Long.parseLong(raw.trim());
-            if (id <= 0) {
-                throw new NumberFormatException("not positive");
-            }
-            return id;
-        } catch (NumberFormatException e) {
-            throw ApiException.badRequest(DEV_RECRUITER_HEADER + " must be a positive number");
-        }
     }
 
     private static <T> T parseBody(APIGatewayV2HTTPEvent event, Class<T> type) {

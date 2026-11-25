@@ -34,6 +34,12 @@
             <groupId>helloworld</groupId>
             <artifactId>hiremebot-common</artifactId>
         </dependency>
+        <!-- Verifies the Cognito access token (the shared JwtAccessTokenVerifier in common; its nimbus dependency is
+             optional there, so each Lambda that verifies tokens declares it). -->
+        <dependency>
+            <groupId>com.nimbusds</groupId>
+            <artifactId>nimbus-jose-jwt</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>

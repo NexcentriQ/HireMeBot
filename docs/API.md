@@ -1,21 +1,30 @@
 # HireMeBot API Reference
 
-Five endpoints, served by three Lambdas:
+Nine endpoints, served by four Lambdas:
 
 | Endpoint | Purpose | Lambda |
 |---|---|---|
+| [`GET /api/v1/recruiters/auth/me`](RECRUITER_AUTH_API.md#3-get-apiv1recruitersauthme) | "Continue with Google" for the recruiter portal: is this Google user a registered recruiter, and approved? Returns `nextStep` (`RECRUITER_DASHBOARD`, `RECRUITER_SIGNUP_FORM`, `APPROVAL_PENDING`) | Registration |
+| [`POST /api/v1/recruiters/register`](RECRUITER_AUTH_API.md#4-post-apiv1recruitersregister) | A new recruiter, signed in with Google, registers; the account is `PENDING` until the owner approves it in MySQL | Registration |
+| [`GET /api/v1/auth/me`](STUDENT_AUTH_API.md#3-get-apiv1authme) | "Continue with Google": is this Google user a registered student? Returns `nextStep` (`DASHBOARD`, `SIGNUP_FORM`, `ACCOUNT_PENDING`) | Registration |
+| [`POST /api/v1/students/register`](STUDENT_AUTH_API.md#4-post-apiv1studentsregister) | A new student, signed in with Google, creates their HireMeBot account | Registration |
 | [`POST /api/v1/recruiter/applications`](#1-post-apiv1recruiterapplications) | A recruiter records a job application they already made for an assigned student | RecruiterLambda |
 | [`GET /api/v1/recruiter/students`](#2-get-apiv1recruiterstudents) | A recruiter lists their active assigned students (fills the Apply Job form's student dropdown) | RecruiterLambda |
 | [`GET /api/v1/student/applications`](#3-get-apiv1studentapplications) | A student's dashboard: today's recorded applications plus monthly/daily/weekly progress statistics | StudentLambda |
 | [`POST /api/v1/documents/upload-url`](#4-post-apiv1documentsupload-url) | A recruiter checks for a duplicate and gets a presigned S3 PUT URL for a student's resume | DocumentManagementLambda |
 | [`POST /api/v1/documents/register`](#5-post-apiv1documentsregister) | A recruiter registers the uploaded resume (after verification) and receives its `objectId` | DocumentManagementLambda |
 
-> **Status: development only.** Authentication is not implemented yet. Callers are identified by temporary
-> `X-Dev-*` headers that are **not authentication** and are accepted only when the server is started with the
-> matching flag. Do not expose these APIs publicly until Cognito/JWT replaces them (see
-> [Authentication](#authentication-development-only)). The two document endpoints are stricter: they accept the
-> header only under `sam local`, so a deployed stack answers `403` to every document call until production
-> authentication exists.
+> **Student and recruiter sign-in and registration are the exception:** all four require a real Cognito access token
+> and use their own response shape (`code` instead of `error`). They are documented separately in
+> [STUDENT_AUTH_API.md](STUDENT_AUTH_API.md) and [RECRUITER_AUTH_API.md](RECRUITER_AUTH_API.md); the rest of this page
+> does not apply to them. The recruiter endpoints below (`/api/v1/recruiter/...`, singular, and the documents API) only
+> serve recruiters whose account is `ACTIVE`, i.e. approved: a recruiter who registered through the Google flow is
+> `PENDING` until the owner approves them in MySQL.
+>
+> **Authentication.** The four recruiter and document endpoints and the student dashboard endpoint
+> (`GET /api/v1/student/applications`) authenticate with the **Cognito access token** in the `Authorization` header
+> (`Bearer <token>`); the acting recruiter or student is always resolved from the verified token, never from anything
+> the client sends (see [Authentication](#authentication)).
 
 ---
 
@@ -65,18 +74,65 @@ Error bodies never contain SQL, stack traces, hostnames or credentials; the tech
 | `INTERNAL_ERROR` | 500 | unexpected server error |
 | `SERVICE_UNAVAILABLE` | 503 | the database is temporarily unreachable; safe to retry |
 
-### Authentication (development only)
+### Authentication
 
-| Endpoint | Header | Server flag that enables it |
-|---|---|---|
-| POST recruiter applications | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` |
-| GET recruiter students | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` (same flag as the POST) |
-| POST documents upload-url / register | `X-Dev-Recruiter-Id: <recruiter user_id>` | `ALLOW_DEV_RECRUITER_HEADER=true` **and** running under `sam local`; refused in every deployed environment |
-| GET student applications | `X-Dev-Student-Id: <student user_id>` | `ALLOW_DEV_STUDENT_HEADER=true` |
+**Recruiter and document endpoints** (`POST /api/v1/recruiter/applications`, `GET /api/v1/recruiter/students`,
+`POST /api/v1/documents/upload-url`, `POST /api/v1/documents/register`) need the Cognito **access** token, the same one
+the portal uses for `GET /api/v1/recruiters/auth/me` (not the ID token, not a Google token):
 
-The flag defaults to `false`. While it is `false`, the endpoint answers **403** to every request, whatever headers
-are sent, so a deployed stack cannot be reached by simply sending a header. When Cognito/JWT is added, these
-headers will be removed and the caller will be identified from the validated token instead.
+```http
+Authorization: Bearer <Cognito access token>
+```
+
+The acting recruiter is resolved **only** from that token:
+
+1. API Gateway's JWT authorizer (deployed) checks issuer, app client, expiry and the `openid` scope. The Lambda then
+   verifies the token itself (RS256 signature by the pool's keys, `token_use = access`, exact `client_id`, lifetime),
+   also under `sam local`, where authorizers do not run.
+2. The token's `sub` is mapped through `user_identities` to an account, which must be an approved recruiter: not
+   deleted, a `recruiters` row (a student, manager or role-less user is refused, never converted), not `SUSPENDED`, a
+   `GOOGLE` identity, and `account_status = 'ACTIVE'` (a `PENDING` recruiter waiting for the owner's manual approval is
+   refused). Nothing is ever created or changed by this check.
+3. The endpoint's own checks then run with that recruiter id: the student must be assigned to them, and document objects
+   are registered under that student only.
+
+Nothing else in the request can choose the actor: a `recruiterId` or user id in the body or query string, an email, an
+`X-Dev-Recruiter-Id` header or any other id header is ignored (or, for an unknown body field, rejected).
+
+| Situation | Status | `error` | `message` |
+|---|---|---|---|
+| No `Authorization` header; a malformed one; an invalid, expired, ID, foreign-pool or wrong-client token | 401 | `UNAUTHORIZED` | `Authentication is required.` (deployed: API Gateway answers `{"message":"Unauthorized"}` before the Lambda) |
+| Valid token, but the account is not an approved recruiter | 403 | `FORBIDDEN` | `This account is not registered as a recruiter` / `This account is unavailable` (deleted) / `This account is not a recruiter account` (student, manager) / `Your recruiter account has been suspended` / `A Google sign-in is required` / `Your recruiter account is waiting for approval` |
+| Cognito signing keys or the database temporarily unavailable | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` |
+
+**Local-only fallback.** `X-Dev-Recruiter-Id: <recruiter user_id>` identifies the caller only when **all three** hold: the
+request has no `Authorization` header at all, `ALLOW_DEV_RECRUITER_HEADER=true`, and the process runs under `sam local`
+(`AWS_SAM_LOCAL=true`, set by the SAM CLI and never by AWS). A token, valid or not, always wins: a bad token is `401` and is
+never retried as the header. A deployed stack ignores the header whatever flag is set, so without a token it answers
+`401`. On this local path a missing or malformed header is `400`, and the services still refuse a recruiter who is not
+`ACTIVE`. The flag belongs only in the git-ignored local `env.json`.
+
+**Student dashboard** (`GET /api/v1/student/applications`) uses the same Cognito access token. The acting student is
+resolved **only** from the verified token (the authorizer, the Lambda's own verification and the `sub` mapping work as
+above), so a student can only ever read their own applications:
+
+- The `sub` is mapped through `user_identities`, `users` and `students` to an account that must be a usable student: not
+  deleted (`is_deleted = FALSE`), a `students` row (a recruiter, manager or role-less user is refused), not `SUSPENDED`, a
+  `GOOGLE` identity and `account_status = 'ACTIVE'` (a `PENDING` student is refused). The status is read on every request,
+  so a suspension or deletion takes effect on the next call. Nothing is ever created or changed by this check.
+- Any student id sent by the client (`X-Dev-Student-Id`, `X-Student-Id`, `studentId` in the query) is ignored when a token
+  is present.
+- Failures: `401 UNAUTHORIZED` (no, malformed, invalid, expired, ID, foreign-pool or wrong-client token) and
+  `403 FORBIDDEN` (not an active student); see the [error table](#error-responses-2) of the endpoint.
+
+**Local-only fallback.** `X-Dev-Student-Id: <student user_id>` identifies the caller only when **all three** hold: the request
+has no `Authorization` header at all, `ALLOW_DEV_STUDENT_HEADER=true`, and the process runs under `sam local`
+(`AWS_SAM_LOCAL=true`), the same `DevAuth` rule as the recruiter header. A token, valid or not, always wins: a bad token is
+`401` and is never retried as the header. A deployed stack ignores the header whatever flag is set, so without a token it
+answers `401`. The header is not allowed by CORS. On this local path a missing or malformed header is `400`.
+
+For the curl examples below: `export COGNITO_ACCESS_TOKEN=<an access token of an approved recruiter>` (type it, do not paste
+it into scripts or tickets; it expires after 60 minutes).
 
 ---
 
@@ -93,7 +149,7 @@ the same job link twice for the same student and the second call is a `409`.
 | Header | Required | Description |
 |---|---|---|
 | `Content-Type` | recommended | `application/json`. Not enforced: the body is always parsed as JSON |
-| `X-Dev-Recruiter-Id` | yes | positive integer: the recruiter's `user_id` |
+| `Authorization` | yes | `Bearer <Cognito access token>` of an approved recruiter (see [Authentication](#authentication)) |
 
 **Body**
 
@@ -171,20 +227,21 @@ before a malformed body, and a malformed body before field validation.
 |---|---|---|---|---|
 | 1 | 404 | `NOT_FOUND` | `Route not found` | path is not `/api/v1/recruiter/applications` |
 | 2 | 405 | `METHOD_NOT_ALLOWED` | `Method not allowed; use POST` | method is not `POST`; response has header `Allow: POST` |
-| 3 | 403 | `FORBIDDEN` | `Recruiter authentication is not configured` | `ALLOW_DEV_RECRUITER_HEADER` is not `true` on the server |
-| 4 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Recruiter-Id` | header absent or blank |
-| 5 | 400 | `BAD_REQUEST` | `X-Dev-Recruiter-Id must be a positive number` | header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
-| 6 | 400 | `BAD_REQUEST` | `Request body is required` | body missing, blank, or the JSON literal `null` |
-| 7 | 400 | `BAD_REQUEST` | `Request body is not valid base64` | body flagged as base64 by the gateway but not decodable |
-| 8 | 400 | `BAD_REQUEST` | `Unknown field '<name>' is not allowed` | the body contains a field that is not in the schema, e.g. `recruiterId` (names longer than 50 characters are truncated) |
-| 9 | 400 | `BAD_REQUEST` | `Malformed or invalid JSON request body` | invalid JSON, a JSON array/string instead of an object, a wrong value type, or trailing content |
-| 10 | 400 | `VALIDATION_ERROR` | `Request validation failed` | one or more field rules failed; **all** problems are listed in `details` (see below) |
-| 11 | 403 | `FORBIDDEN` | `Recruiter is not assigned to this student` | no active assignment: the student is not assigned to this recruiter, either user does not exist or is soft-deleted, or the assignment was removed while the request ran |
-| 12 | 403 | `FORBIDDEN` | `Resume object does not exist` | `documents.resumeObjectId` is not a resume of this student: it does not exist, belongs to another student, or is not of type `RESUME` |
-| 13 | 403 | `FORBIDDEN` | `Cover letter object does not exist` | `documents.coverLetterObjectId` was sent but is not a cover letter of this student (missing, another student's, or the wrong type) |
-| 14 | 409 | `CONFLICT` | `An application for this student and job link already exists` | the student already has an application with this `jobLink`. Concurrent identical requests are safe: exactly one gets `201`, the rest get `409` |
-| 15 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; nothing was stored, so the request can be retried |
-| 16 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure; nothing was stored. Includes a server that is missing its database configuration |
+| 3 | 401 | `UNAUTHORIZED` | `Authentication is required.` | no `Authorization` header (and no local dev header), or an invalid, expired, ID, foreign-pool or wrong-client token; never falls back to the dev header |
+| 4 | 403 | `FORBIDDEN` | see [Authentication](#authentication) | a valid token whose account is not an approved recruiter (not registered, deleted, student or manager, suspended, not Google, or `PENDING`) |
+| 5 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Recruiter-Id` | **local header-only path** only (`sam local`, flag on, no `Authorization`): header absent or blank |
+| 6 | 400 | `BAD_REQUEST` | `X-Dev-Recruiter-Id must be a positive number` | **local header-only path** only: header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
+| 7 | 400 | `BAD_REQUEST` | `Request body is required` | body missing, blank, or the JSON literal `null` |
+| 8 | 400 | `BAD_REQUEST` | `Request body is not valid base64` | body flagged as base64 by the gateway but not decodable |
+| 9 | 400 | `BAD_REQUEST` | `Unknown field '<name>' is not allowed` | the body contains a field that is not in the schema, e.g. `recruiterId` (names longer than 50 characters are truncated) |
+| 10 | 400 | `BAD_REQUEST` | `Malformed or invalid JSON request body` | invalid JSON, a JSON array/string instead of an object, a wrong value type, or trailing content |
+| 11 | 400 | `VALIDATION_ERROR` | `Request validation failed` | one or more field rules failed; **all** problems are listed in `details` (see below) |
+| 12 | 403 | `FORBIDDEN` | `Recruiter is not assigned to this student` | no active assignment: the student is not assigned to this recruiter, either user does not exist or is soft-deleted, the recruiter is not approved (`account_status` is `PENDING` or `SUSPENDED`, not `ACTIVE`), or the assignment was removed while the request ran |
+| 13 | 403 | `FORBIDDEN` | `Resume object does not exist` | `documents.resumeObjectId` is not a resume of this student: it does not exist, belongs to another student, or is not of type `RESUME` |
+| 14 | 403 | `FORBIDDEN` | `Cover letter object does not exist` | `documents.coverLetterObjectId` was sent but is not a cover letter of this student (missing, another student's, or the wrong type) |
+| 15 | 409 | `CONFLICT` | `An application for this student and job link already exists` | the student already has an application with this `jobLink`. Concurrent identical requests are safe: exactly one gets `201`, the rest get `409` |
+| 16 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; nothing was stored, so the request can be retried |
+| 17 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure; nothing was stored. Includes a server that is missing its database configuration |
 
 Notes:
 
@@ -232,7 +289,7 @@ Example:
 ```bash
 curl -i -X POST http://127.0.0.1:3000/api/v1/recruiter/applications \
   -H "Content-Type: application/json" \
-  -H "X-Dev-Recruiter-Id: 1000000001" \
+  -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN" \
   -d '{
     "studentId": 1000000002,
     "application": {
@@ -261,11 +318,11 @@ there is no pagination. It is read-only.
 
 | Header | Required | Description |
 |---|---|---|
-| `X-Dev-Recruiter-Id` | yes | positive integer: the recruiter's `user_id` (development only, see [Authentication](#authentication-development-only)) |
+| `Authorization` | yes | `Bearer <Cognito access token>` of an approved recruiter (see [Authentication](#authentication)) |
 | `Accept` | no | `application/json`; not enforced |
 
-No body and no query parameters. The recruiter is identified **only** by the header: a `recruiterId` in the query
-string is ignored, never trusted.
+No body and no query parameters. The recruiter is identified **only** by the verified token: a `recruiterId` in the query
+string, or an `X-Dev-Recruiter-Id` header, is ignored, never trusted.
 
 **Which students are returned.** Those with a row in `recruiter_student_assignments` for this recruiter whose user is
 not soft-deleted. A student assigned to another recruiter is never returned. The schema has no separate "active"
@@ -343,12 +400,13 @@ Checks run in the order below, and the first failure is returned.
 |---|---|---|---|---|
 | 1 | 404 | `NOT_FOUND` | `Route not found` | path is not one of the recruiter routes |
 | 2 | 405 | `METHOD_NOT_ALLOWED` | `Method not allowed; use GET` | method is not `GET`; response has header `Allow: GET` |
-| 3 | 403 | `FORBIDDEN` | `Recruiter authentication is not configured` | `ALLOW_DEV_RECRUITER_HEADER` is not `true` on the server |
-| 4 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Recruiter-Id` | header absent or blank |
-| 5 | 400 | `BAD_REQUEST` | `X-Dev-Recruiter-Id must be a positive number` | header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
-| 6 | 403 | `FORBIDDEN` | `Recruiter does not exist or is not active` | no `recruiters` row for that id, the id belongs to a user who is not a recruiter, or the recruiter is soft-deleted |
-| 7 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; safe to retry |
-| 8 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure, including a server that is missing its database configuration |
+| 3 | 401 | `UNAUTHORIZED` | `Authentication is required.` | no `Authorization` header (and no local dev header), or an invalid, expired, ID, foreign-pool or wrong-client token; never falls back to the dev header |
+| 4 | 403 | `FORBIDDEN` | see [Authentication](#authentication) | a valid token whose account is not an approved recruiter (not registered, deleted, student or manager, suspended, not Google, or `PENDING`) |
+| 5 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Recruiter-Id` | **local header-only path** only (`sam local`, flag on, no `Authorization`): header absent or blank |
+| 6 | 400 | `BAD_REQUEST` | `X-Dev-Recruiter-Id must be a positive number` | **local header-only path** only: header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
+| 7 | 403 | `FORBIDDEN` | `Recruiter does not exist or is not active` | no `recruiters` row for that id, the id belongs to a user who is not a recruiter, the recruiter is soft-deleted, or the recruiter is not approved (`account_status` is not `ACTIVE`; a recruiter who signed up through `POST /api/v1/recruiters/register` is `PENDING` until the operator approves them) |
+| 8 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; safe to retry |
+| 9 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure, including a server that is missing its database configuration |
 
 Notes:
 
@@ -362,13 +420,13 @@ Notes:
 ```bash
 curl -i "http://127.0.0.1:3000/api/v1/recruiter/students" \
   -H "Accept: application/json" \
-  -H "X-Dev-Recruiter-Id: 1000000001"
+  -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN"
 ```
 
 ```powershell
 curl.exe -i "http://127.0.0.1:3000/api/v1/recruiter/students" `
   -H "Accept: application/json" `
-  -H "X-Dev-Recruiter-Id: 1000000001"
+  -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN"
 ```
 
 ---
@@ -387,7 +445,7 @@ caching are the client's job.
 
 | Header | Required | Description |
 |---|---|---|
-| `X-Dev-Student-Id` | yes | positive integer: the student's `user_id` |
+| `Authorization` | yes | `Bearer <Cognito access token>` of the student (the access token, not the ID token). The student is resolved only from this token; a student id in a header or query string is ignored. See [Authentication](#authentication) |
 
 No body. `Content-Type` is not needed.
 
@@ -547,20 +605,22 @@ Checks run in the order below, and the first failure is returned.
 |---|---|---|---|---|
 | 1 | 404 | `NOT_FOUND` | `Route not found` | path is not `/api/v1/student/applications` |
 | 2 | 405 | `METHOD_NOT_ALLOWED` | `Method not allowed; use GET` | method is not `GET`; response has header `Allow: GET` |
-| 3 | 403 | `FORBIDDEN` | `Student authentication is not configured` | `ALLOW_DEV_STUDENT_HEADER` is not `true` on the server |
-| 4 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Student-Id` | header absent or blank |
-| 5 | 400 | `BAD_REQUEST` | `X-Dev-Student-Id must be a positive number` | header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
-| 6 | 400 | `BAD_REQUEST` | `Query parameter '<name>' is not accepted; this endpoint always reports the current date and returns all pages` | a deprecated parameter was sent: `date`, `startDate`, `endDate`, `month`, `week`, `page` or `size` |
-| 7 | 404 | `NOT_FOUND` | `Student not found` | the student does not exist, is soft-deleted, or the id belongs to a user who is not a student |
-| 8 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out; safe to retry |
-| 9 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure, including a server that is missing its database configuration |
+| 3 | 401 | `UNAUTHORIZED` | `Authentication is required.` | no `Authorization` header (and no permitted local header); a malformed one; an invalid, expired, ID, foreign-pool or wrong-client token. Deployed, API Gateway answers `{"message":"Unauthorized"}` before the Lambda |
+| 4 | 403 | `FORBIDDEN` | `This account is not registered as a student` / `This account is unavailable` / `This account is not a student account` / `Your student account has been suspended` / `A Google sign-in is required` / `Your student account is waiting for activation` | valid token, but the account is not an `ACTIVE`, non-deleted student: no `user_identities` row, soft-deleted, a recruiter or manager (no `students` row), `SUSPENDED`, not a Google identity, `PENDING` |
+| 5 | 400 | `BAD_REQUEST` | `Missing required header X-Dev-Student-Id` | **local only** (see Authentication): header absent or blank |
+| 6 | 400 | `BAD_REQUEST` | `X-Dev-Student-Id must be a positive number` | **local only**: header is not a positive integer (`abc`, `0`, `-5`, `1.5`, or too large for 64 bits) |
+| 7 | 400 | `BAD_REQUEST` | `Query parameter '<name>' is not accepted; this endpoint always reports the current date and returns all pages` | a deprecated parameter was sent: `date`, `startDate`, `endDate`, `month`, `week`, `page` or `size` |
+| 8 | 404 | `NOT_FOUND` | `Student not found` | the student was soft-deleted between authentication and the read (rare race) |
+| 9 | 503 | `SERVICE_UNAVAILABLE` | `The service is temporarily unavailable. Please try again later.` | database unreachable or connection pool timed out, or the Cognito signing keys could not be fetched; safe to retry |
+| 10 | 500 | `INTERNAL_ERROR` | `An unexpected error occurred.` | any other failure, including a server that is missing its database or Cognito configuration |
 
 Notes:
 
 - A student with no applications today is **not** a `404`; that is a `200` with empty `pages` (and their profile).
-- The `404` in row 7 and the `404` in row 1 share the `NOT_FOUND` code. Their `message` differs.
-- Row 7 returns only the error envelope: no profile, application or statistics data is ever returned for a student
-  who is not found, and a different student's data is never substituted.
+- The `404` in row 8 and the `404` in row 1 share the `NOT_FOUND` code. Their `message` differs.
+- Rows 3 to 8 return only the error envelope: no profile, application or statistics data is ever returned to a caller who
+  is not an active student, and a different student's data is never substituted.
+- Authentication (rows 3 to 6) runs after the route and method checks and before the query-parameter check.
 
 #### Frontend caching
 
@@ -572,8 +632,14 @@ verification). The payload is private student data (name, email, phone): do not 
 ### Example
 
 ```bash
-curl -i "http://127.0.0.1:3000/api/v1/student/applications" \
-  -H "X-Dev-Student-Id: 1000000002"
+curl -i "https://<api-id>.execute-api.us-east-2.amazonaws.com/api/v1/student/applications" \
+  -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN"
+```
+
+Locally under `sam local start-api`, with no token and `ALLOW_DEV_STUDENT_HEADER=true` in the git-ignored `env.json`:
+
+```bash
+curl -i "http://127.0.0.1:3000/api/v1/student/applications" -H "X-Dev-Student-Id: 1000000002"
 ```
 
 ---
@@ -602,16 +668,14 @@ never creates an application.
   declared content type must agree.
 - **Global uniqueness by content.** The SHA-256 of the bytes is unique across the whole system. The same bytes can never
   be registered twice, by anyone, under any document type. A document belongs to exactly one student and is never shared.
-- **Authorization.** The caller must be an active recruiter assigned to the student. The recruiter is the authenticated
+- **Authorization.** The caller must be an active recruiter (a non-deleted recruiter whose `account_status` is `ACTIVE`, i.e. approved) assigned to the student. The recruiter is the authenticated
   identity, never a field in the body.
 - **Nothing is written to MySQL until the upload has been verified** (the `register` call).
 - Responses carry `Cache-Control: no-store`: they contain upload URLs and tokens, which are credentials. Never log them.
 
-> **Authentication for these two endpoints is local-development only.** The recruiter is identified by
-> `X-Dev-Recruiter-Id`, and the server accepts that header **only when it runs under `sam local`**. In any deployed
-> environment these endpoints answer `403 Recruiter authentication is not configured` to every request, whatever
-> headers are sent. **Production authentication (a validated Cognito/JWT identity mapped to a recruiter) is a
-> prerequisite before these APIs are exposed publicly.**
+> **Authentication for these two endpoints** is the Cognito access token (`Authorization: Bearer <token>`), resolved to an
+> approved recruiter exactly as described under [Authentication](#authentication). The `X-Dev-Recruiter-Id` header works
+> only on a local `sam local` run with no token, and a deployed stack ignores it.
 
 ---
 
@@ -622,7 +686,7 @@ nothing to MySQL or to S3.
 
 ### Request
 
-**Headers:** `Content-Type: application/json`, `X-Dev-Recruiter-Id: <recruiter user_id>` (local development only).
+**Headers:** `Content-Type: application/json`, `Authorization: Bearer <Cognito access token>` of an approved recruiter.
 
 ```json
 {
@@ -696,17 +760,18 @@ Checks run in this order and the first failure is returned. All use the standard
 |---|---|---|---|
 | 1 | 404 | `NOT_FOUND` | path is not an endpoint of this API |
 | 2 | 405 | `METHOD_NOT_ALLOWED` | method is not `POST` (`Allow: POST`) |
-| 3 | 403 | `FORBIDDEN` (`Recruiter authentication is not configured`) | dev authentication is not permitted here: any deployed environment, or the flag is off |
-| 4 | 400 | `BAD_REQUEST` | `X-Dev-Recruiter-Id` missing or not a positive integer |
-| 5 | 400 | `BAD_REQUEST` | body missing, malformed JSON, wrong type, or contains an unknown field |
-| 6 | 400 | `DOCUMENT_TYPE_NOT_ENABLED` | the type is not enabled (`COVER_LETTER` in V1). Reported before other field errors |
-| 7 | 400 | `VALIDATION_ERROR` | a field rule failed; every problem is in `details`, e.g. `fileName must end with one of: pdf, docx`, `contentType must be application/pdf for a .pdf file`, `fileSize must be between 1 and 5242880 bytes`, `checksum must be a SHA-256 value: 64 hexadecimal characters` |
-| 8 | 403 | `FORBIDDEN` (`Recruiter does not exist or is not active`) | the caller is not an active recruiter (a student id, a manager id, a deleted or unknown user) |
-| 9 | 403 | `FORBIDDEN` (`Recruiter is not assigned to this student`) | not assigned, either user deleted, or the student does not exist |
-| 10 | 409 | `DUPLICATE_DOCUMENT` | these bytes are registered to **another student**, or to this student under **another document type**. The message is generic (`This document is already registered.`): it never names the other student, a key or an id |
-| 11 | 409 | `DOCUMENT_UNAVAILABLE` | these bytes are registered for this student but the stored file is missing. It cannot be re-uploaded (the checksum is unique). Contact support |
-| 12 | 503 | `SERVICE_UNAVAILABLE` | database or S3 temporarily unavailable; safe to retry |
-| 13 | 500 | `INTERNAL_ERROR` | anything else (cause only in the logs) |
+| 3 | 401 | `UNAUTHORIZED` | no `Authorization` header (and no local dev header), or an invalid, expired, ID, foreign-pool or wrong-client token; never falls back to the dev header |
+| 4 | 403 | `FORBIDDEN` | a valid token whose account is not an approved recruiter (see [Authentication](#authentication)) |
+| 5 | 400 | `BAD_REQUEST` | **local header-only path** only: `X-Dev-Recruiter-Id` missing or not a positive integer |
+| 6 | 400 | `BAD_REQUEST` | body missing, malformed JSON, wrong type, or contains an unknown field |
+| 7 | 400 | `DOCUMENT_TYPE_NOT_ENABLED` | the type is not enabled (`COVER_LETTER` in V1). Reported before other field errors |
+| 8 | 400 | `VALIDATION_ERROR` | a field rule failed; every problem is in `details`, e.g. `fileName must end with one of: pdf, docx`, `contentType must be application/pdf for a .pdf file`, `fileSize must be between 1 and 5242880 bytes`, `checksum must be a SHA-256 value: 64 hexadecimal characters` |
+| 9 | 403 | `FORBIDDEN` (`Recruiter does not exist or is not active`) | the caller is not an active recruiter (a student id, a manager id, a deleted or unknown user, or a `PENDING` / `SUSPENDED` recruiter) |
+| 10 | 403 | `FORBIDDEN` (`Recruiter is not assigned to this student`) | not assigned, either user deleted, or the student does not exist |
+| 11 | 409 | `DUPLICATE_DOCUMENT` | these bytes are registered to **another student**, or to this student under **another document type**. The message is generic (`This document is already registered.`): it never names the other student, a key or an id |
+| 12 | 409 | `DOCUMENT_UNAVAILABLE` | these bytes are registered for this student but the stored file is missing. It cannot be re-uploaded (the checksum is unique). Contact support |
+| 13 | 503 | `SERVICE_UNAVAILABLE` | database or S3 temporarily unavailable; safe to retry |
+| 14 | 500 | `INTERNAL_ERROR` | anything else (cause only in the logs) |
 
 A **presigned URL that has expired** is not an error from this API: S3 answers the `PUT` with `403`. Call `upload-url`
 again for a fresh URL.
@@ -715,7 +780,7 @@ again for a fresh URL.
 
 ```bash
 curl -i -X POST http://127.0.0.1:3000/api/v1/documents/upload-url \
-  -H "Content-Type: application/json" -H "X-Dev-Recruiter-Id: 1000000001" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN" \
   -d '{"studentId":1000000005,"documentType":"RESUME","fileName":"Akhil_Resume.pdf","contentType":"application/pdf","fileSize":245760,"checksum":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}'
 ```
 
@@ -728,7 +793,7 @@ returns its `objectId`. It is idempotent and safe to retry.
 
 ### Request
 
-**Headers:** `Content-Type: application/json`, `X-Dev-Recruiter-Id: <recruiter user_id>` (local development only).
+**Headers:** `Content-Type: application/json`, `Authorization: Bearer <Cognito access token>` of an approved recruiter.
 
 ```json
 {
@@ -780,7 +845,7 @@ student also return that existing `objectId`.
 |---|---|---|---|
 | 1-5 | 404 / 405 / 403 / 400 | as for `upload-url` | route, method, dev-auth, header, body |
 | 6 | 400 | `DOCUMENT_TYPE_NOT_ENABLED` / `VALIDATION_ERROR` | type disabled, or a field is missing or malformed (`details` lists them) |
-| 7 | 403 | `FORBIDDEN` | not an active recruiter, or not assigned to the student |
+| 7 | 403 | `FORBIDDEN` | not an active recruiter (including a `PENDING` or `SUSPENDED` one), or not assigned to the student |
 | 8 | 400 | `UPLOAD_TOKEN_EXPIRED` | the token (30 minutes) expired: request a new upload URL and upload again |
 | 9 | 403 | `UPLOAD_TOKEN_INVALID` | token malformed, forged, issued to another recruiter, bound to different values than the request, or the key is not the one the server issued |
 | 10 | 409 | `DUPLICATE_DOCUMENT` | these bytes belong to another student or another document type |
@@ -816,7 +881,7 @@ stored bytes are the bytes the browser hashed; it says nothing about their conte
 
 ```bash
 curl -i -X POST http://127.0.0.1:3000/api/v1/documents/register \
-  -H "Content-Type: application/json" -H "X-Dev-Recruiter-Id: 1000000001" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN" \
   -d '{"studentId":1000000005,"documentType":"RESUME","objectKey":"<objectKey>","checksum":"<sha256>","uploadToken":"<uploadToken>"}'
 ```
 
@@ -828,8 +893,9 @@ curl -i -X POST http://127.0.0.1:3000/api/v1/documents/register \
 |---|---|---|---|
 | **200** OK | not used | assigned students returned (including none) | today's applications and statistics returned (including none today) |
 | **201** Created | application recorded | not used | not used |
-| **400** Bad Request | bad header, bad body, or failed field validation | missing or invalid `X-Dev-Recruiter-Id` | bad header, or a deprecated query parameter was sent |
-| **403** Forbidden | dev header not enabled; recruiter not assigned (or user missing/deleted); resume or cover letter not found | dev header not enabled; recruiter does not exist or is deleted | dev header not enabled |
+| **401** Unauthorized | no or invalid Cognito access token | no or invalid Cognito access token | not used |
+| **400** Bad Request | bad body or failed field validation (local header-only path: bad header) | local header-only path: missing or invalid `X-Dev-Recruiter-Id` | bad header, or a deprecated query parameter was sent |
+| **403** Forbidden | account is not an approved recruiter; recruiter not assigned (or user missing/deleted); resume or cover letter not found | account is not an approved recruiter; recruiter does not exist or is deleted | dev header not enabled |
 | **404** Not Found | unknown route | unknown route | unknown route; student not found or deleted |
 | **405** Method Not Allowed | any method but `POST` (`Allow: POST`) | any method but `GET` (`Allow: GET`) | any method but `GET` (`Allow: GET`) |
 | **409** Conflict | duplicate application for this student and job link | not used | not used |
@@ -857,9 +923,7 @@ generic failure.
 
 ## Not implemented yet
 
-- Authentication and authorization (Cognito/JWT); the `X-Dev-*` headers are a stand-in and will be removed. This is a
-  hard prerequisite for exposing any endpoint, and for the document endpoints it is the only way they can work once
-  deployed.
+- Rate limiting for the student dashboard and the other endpoints (audit finding RATE-01).
 - Pagination controls (`page`, `limit`) on the GET: it intentionally returns every page at once.
 - Rate limiting, and API versioning beyond the `/v1` path prefix. (CORS is configured for one explicit portal origin.)
 - Reading, downloading and deleting documents, cover-letter upload, and malware scanning of uploads.

@@ -1,0 +1,922 @@
+{
+  "info": {
+    "name": "HireMeBot - Recruiter workspace APIs (Cognito access token)",
+    "description": "The four recruiter-workspace APIs, authenticated with the Cognito ACCESS token (no recruiter id is ever sent):\n  GET  /api/v1/recruiter/students\n  POST /api/v1/recruiter/applications\n  POST /api/v1/documents/upload-url\n  POST /api/v1/documents/register\n\nEnvironment variables\n  BASE_URL                         http://127.0.0.1:3000 for sam local, or the deployed API URL\n  COGNITO_ACCESS_TOKEN             SECRET. An access token of an APPROVED recruiter (current value only; never commit or share it)\nOptional (requests that need them are skipped when empty)\n  COGNITO_ACCESS_TOKEN_PENDING     SECRET. Token of a recruiter still PENDING approval\n  COGNITO_ACCESS_TOKEN_STUDENT     SECRET. Token of a Google account registered as a student\n  STUDENT_ID                       a student assigned to the approved recruiter\n  OTHER_STUDENT_ID                 a student assigned to a DIFFERENT recruiter\n  RESUME_OBJECT_ID                 a resume object (object_store_entries.object_id) of STUDENT_ID\n\nHow to get a token: sign in to the portal with Continue with Google, then in the browser console run\n  (await fetchAuthSession()).tokens.accessToken.toString()\nand paste the result straight into the variable's current value. It expires after 60 minutes.\n\nExpected results: 200/201 for the approved recruiter on their own students; 401 for no/invalid token; 403 for a pending,\nsuspended, deleted, student or manager account and for another recruiter's student. Deployed, API Gateway answers a missing\nor invalid token with {\"message\":\"Unauthorized\"} before the Lambda, so those tests accept both bodies. See docs/API.md.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{COGNITO_ACCESS_TOKEN}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('JSON error envelope on failures', () => {",
+          "  if (pm.response.code >= 400) {",
+          "    const json = pm.response.json();",
+          "    pm.expect(json.success === false || json.message !== undefined).to.eql(true);",
+          "  }",
+          "});"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. GET recruiter/students",
+      "item": [
+        {
+          "name": "Approved recruiter: own assigned students (200)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{BASE_URL}}/api/v1/recruiter/students",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "No recruiter id is sent: the acting recruiter is resolved from the token."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('200 with only the documented fields', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(true);",
+                  "    pm.expect(json.data.recruiterId).to.be.a('number');",
+                  "    pm.expect(json.data.totalStudents).to.eql(json.data.students.length);",
+                  "    json.data.students.forEach(s => pm.expect(Object.keys(s).sort()).to.eql(",
+                  "      ['assignedAt', 'email', 'firstName', 'fullName', 'lastName', 'studentId']));",
+                  "    pm.collectionVariables.set('actingRecruiterId', String(json.data.recruiterId));",
+                  "  });",
+                  "  pm.test('No server internals, credentials or tokens in the body', () => {",
+                  "    const body = pm.response.text();",
+                  "    ['jdbc:', 'SQLException', 'at org.hmb', 'password', 'eyJ'].forEach(s => pm.expect(body).to.not.include(s));",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Same token + X-Dev-Recruiter-Id and ?recruiterId for someone else: the token wins (200, same recruiter)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Dev-Recruiter-Id",
+                "value": "1"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/students?recruiterId=1&userId=1",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Run request 1 first (it records the acting recruiter id)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('The dev header and query parameter have no effect when a token is present', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    const acting = pm.collectionVariables.get('actingRecruiterId');",
+                  "    if (acting) pm.expect(String(pm.response.json().data.recruiterId)).to.eql(acting);",
+                  "    pm.expect(String(pm.response.json().data.recruiterId)).to.not.eql('1');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Dev header ALONE, no token (deployed: 401; local sam with the flag: 200)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Dev-Recruiter-Id",
+                "value": "1000000004"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/students",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('Deployed ignores the header (401); only a local sam run with the flag accepts it', () => {",
+                  "    pm.expect([200, 400, 401, 403]).to.include(pm.response.code);",
+                  "    if (pm.response.code === 200 || pm.response.code === 400) {",
+                  "      pm.expect(pm.variables.get('BASE_URL')).to.match(/^http:\\/\\/(127\\.0\\.0\\.1|localhost)/);",
+                  "    }",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No token (401)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{BASE_URL}}/api/v1/recruiter/students",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('401 (API Gateway {message:Unauthorized} or the Lambda\\'s UNAUTHORIZED)', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.error === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalid token (401), even with a dev header",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Dev-Recruiter-Id",
+                "value": "1000000004"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/students",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "not-a-real-token",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('401 (API Gateway {message:Unauthorized} or the Lambda\\'s UNAUTHORIZED)', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.error === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Recruiter still PENDING approval (403)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{BASE_URL}}/api/v1/recruiter/students",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN_PENDING}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_PENDING')) {",
+                  "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_PENDING to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('403 FORBIDDEN: pending recruiter', () => {",
+                  "    pm.response.to.have.status(403);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(false);",
+                  "    pm.expect(json.error).to.eql('FORBIDDEN');",
+                  "    pm.expect(json.message).to.be.a('string');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Student account token (403)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{BASE_URL}}/api/v1/recruiter/students",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN_STUDENT}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_STUDENT')) {",
+                  "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_STUDENT to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('403 FORBIDDEN: a student is not a recruiter', () => {",
+                  "    pm.response.to.have.status(403);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(false);",
+                  "    pm.expect(json.error).to.eql('FORBIDDEN');",
+                  "    pm.expect(json.message).to.be.a('string');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. POST recruiter/applications",
+      "item": [
+        {
+          "name": "Assigned student (201)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/applications",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"studentId\": {{STUDENT_ID}},\n  \"application\": {\n    \"jobTitle\": \"Postman Test Engineer\",\n    \"companyName\": \"Test Co\",\n    \"jobLocation\": \"Remote\",\n    \"jobLink\": \"https://example.test/jobs/{{$guid}}\",\n    \"jobSource\": \"Postman\"\n  },\n  \"documents\": { \"resumeObjectId\": {{RESUME_OBJECT_ID}} },\n  \"questions\": [ { \"question\": \"Are you willing to relocate?\", \"answer\": \"Yes\" } ]\n}"
+            },
+            "description": "Writes a real application row to the database you point BASE_URL at."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('STUDENT_ID') || !pm.variables.get('RESUME_OBJECT_ID')) {",
+                  "    pm.test.skip('Set STUDENT_ID, RESUME_OBJECT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('201 and an application id', () => {",
+                  "    pm.response.to.have.status(201);",
+                  "    pm.expect(pm.response.json().success).to.eql(true);",
+                  "    pm.expect(pm.response.json().applicationId).to.be.a('number');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Another recruiter's student (403, nothing written)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/applications",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"studentId\": {{OTHER_STUDENT_ID}},\n  \"application\": {\n    \"jobTitle\": \"Postman Test Engineer\",\n    \"companyName\": \"Test Co\",\n    \"jobLocation\": \"Remote\",\n    \"jobLink\": \"https://example.test/jobs/{{$guid}}\",\n    \"jobSource\": \"Postman\"\n  },\n  \"documents\": { \"resumeObjectId\": {{RESUME_OBJECT_ID}} },\n  \"questions\": [ { \"question\": \"Are you willing to relocate?\", \"answer\": \"Yes\" } ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('OTHER_STUDENT_ID') || !pm.variables.get('RESUME_OBJECT_ID')) {",
+                  "    pm.test.skip('Set OTHER_STUDENT_ID, RESUME_OBJECT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('403 FORBIDDEN: student not assigned to this recruiter', () => {",
+                  "    pm.response.to.have.status(403);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(false);",
+                  "    pm.expect(json.error).to.eql('FORBIDDEN');",
+                  "    pm.expect(json.message).to.be.a('string');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "recruiterId in the body is rejected (400), never used",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/applications",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recruiterId\": 1,\n  \"studentId\": {{STUDENT_ID}},\n  \"application\": {\n    \"jobTitle\": \"Postman Test Engineer\",\n    \"companyName\": \"Test Co\",\n    \"jobLocation\": \"Remote\",\n    \"jobLink\": \"https://example.test/jobs/{{$guid}}\",\n    \"jobSource\": \"Postman\"\n  },\n  \"documents\": { \"resumeObjectId\": {{RESUME_OBJECT_ID}} },\n  \"questions\": [ { \"question\": \"Are you willing to relocate?\", \"answer\": \"Yes\" } ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('STUDENT_ID') || !pm.variables.get('RESUME_OBJECT_ID')) {",
+                  "    pm.test.skip('Set STUDENT_ID, RESUME_OBJECT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('400: unknown field recruiterId', () => {",
+                  "    pm.response.to.have.status(400);",
+                  "    pm.expect(pm.response.json().message).to.include('recruiterId');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No token (401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/applications",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('401 (API Gateway {message:Unauthorized} or the Lambda\\'s UNAUTHORIZED)', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.error === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Recruiter still PENDING approval (403)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/recruiter/applications",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN_PENDING}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"studentId\": {{STUDENT_ID}},\n  \"application\": {\n    \"jobTitle\": \"Postman Test Engineer\",\n    \"companyName\": \"Test Co\",\n    \"jobLocation\": \"Remote\",\n    \"jobLink\": \"https://example.test/jobs/{{$guid}}\",\n    \"jobSource\": \"Postman\"\n  },\n  \"documents\": { \"resumeObjectId\": {{RESUME_OBJECT_ID}} },\n  \"questions\": [ { \"question\": \"Are you willing to relocate?\", \"answer\": \"Yes\" } ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_PENDING') || !pm.variables.get('STUDENT_ID') || !pm.variables.get('RESUME_OBJECT_ID')) {",
+                  "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_PENDING, STUDENT_ID, RESUME_OBJECT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('403 FORBIDDEN: pending recruiter', () => {",
+                  "    pm.response.to.have.status(403);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(false);",
+                  "    pm.expect(json.error).to.eql('FORBIDDEN');",
+                  "    pm.expect(json.message).to.be.a('string');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. POST documents/upload-url and register",
+      "item": [
+        {
+          "name": "upload-url for an assigned student (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/documents/upload-url",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"studentId\": {{STUDENT_ID}},\n  \"documentType\": \"RESUME\",\n  \"fileName\": \"Postman_Resume.pdf\",\n  \"contentType\": \"application/pdf\",\n  \"fileSize\": 245760,\n  \"checksum\": \"{{postmanChecksum}}\"\n}"
+            },
+            "description": "Needs a real S3 bucket behind the Lambda. The response contains a presigned URL: never paste it anywhere."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('postmanChecksum', CryptoJS.SHA256(pm.variables.replaceIn('{{$guid}}')).toString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('STUDENT_ID')) {",
+                  "    pm.test.skip('Set STUDENT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('200, an upload is required (a fresh checksum each run)', () => {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(pm.response.json().success).to.eql(true);",
+                  "    pm.expect(pm.response.json().status).to.eql('UPLOAD_REQUIRED');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "upload-url for another recruiter's student (403)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/documents/upload-url",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"studentId\": {{OTHER_STUDENT_ID}},\n  \"documentType\": \"RESUME\",\n  \"fileName\": \"Postman_Resume.pdf\",\n  \"contentType\": \"application/pdf\",\n  \"fileSize\": 245760,\n  \"checksum\": \"{{postmanChecksum}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('postmanChecksum', CryptoJS.SHA256(pm.variables.replaceIn('{{$guid}}')).toString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('OTHER_STUDENT_ID')) {",
+                  "    pm.test.skip('Set OTHER_STUDENT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('403 FORBIDDEN: student not assigned to this recruiter', () => {",
+                  "    pm.response.to.have.status(403);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(false);",
+                  "    pm.expect(json.error).to.eql('FORBIDDEN');",
+                  "    pm.expect(json.message).to.be.a('string');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "upload-url, no token (401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/documents/upload-url",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('401 (API Gateway {message:Unauthorized} or the Lambda\\'s UNAUTHORIZED)', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.error === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "upload-url, recruiter still PENDING (403)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/documents/upload-url",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN_PENDING}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"studentId\": {{STUDENT_ID}},\n  \"documentType\": \"RESUME\",\n  \"fileName\": \"Postman_Resume.pdf\",\n  \"contentType\": \"application/pdf\",\n  \"fileSize\": 245760,\n  \"checksum\": \"{{postmanChecksum}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('postmanChecksum', CryptoJS.SHA256(pm.variables.replaceIn('{{$guid}}')).toString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_PENDING') || !pm.variables.get('STUDENT_ID')) {",
+                  "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_PENDING, STUDENT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('403 FORBIDDEN: pending recruiter', () => {",
+                  "    pm.response.to.have.status(403);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(false);",
+                  "    pm.expect(json.error).to.eql('FORBIDDEN');",
+                  "    pm.expect(json.message).to.be.a('string');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "upload-url, student account token (403)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/documents/upload-url",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{COGNITO_ACCESS_TOKEN_STUDENT}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"studentId\": {{STUDENT_ID}},\n  \"documentType\": \"RESUME\",\n  \"fileName\": \"Postman_Resume.pdf\",\n  \"contentType\": \"application/pdf\",\n  \"fileSize\": 245760,\n  \"checksum\": \"{{postmanChecksum}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('postmanChecksum', CryptoJS.SHA256(pm.variables.replaceIn('{{$guid}}')).toString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_STUDENT') || !pm.variables.get('STUDENT_ID')) {",
+                  "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_STUDENT, STUDENT_ID to run this request');",
+                  "    return;",
+                  "  }",
+                  "  pm.test('403 FORBIDDEN: a student is not a recruiter', () => {",
+                  "    pm.response.to.have.status(403);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.success).to.eql(false);",
+                  "    pm.expect(json.error).to.eql('FORBIDDEN');",
+                  "    pm.expect(json.message).to.be.a('string');",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "register, no token (401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/documents/register",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('401 (API Gateway {message:Unauthorized} or the Lambda\\'s UNAUTHORIZED)', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.error === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "register, invalid token (401), even with a dev header",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Dev-Recruiter-Id",
+                "value": "1000000004"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{BASE_URL}}/api/v1/documents/register",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "not-a-real-token",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "description": "Registering a real upload needs the upload token returned by upload-url plus the file in S3; see DocumentManagementLambda/README.md."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "(() => {",
+                  "  pm.test('401 (API Gateway {message:Unauthorized} or the Lambda\\'s UNAUTHORIZED)', () => {",
+                  "    pm.response.to.have.status(401);",
+                  "    const json = pm.response.json();",
+                  "    pm.expect(json.error === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+                  "  });",
+                  "})();"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "actingRecruiterId",
+      "value": ""
+    },
+    {
+      "key": "postmanChecksum",
+      "value": ""
+    }
+  ]
+}

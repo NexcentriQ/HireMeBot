@@ -46,8 +46,11 @@ public final class DatabaseConfig {
         return local;
     }
 
-    /** Builds a new pool from the given environment map. Visible for testing. */
-    static HikariDataSource create(Map<String, String> env) {
+    /**
+     * Builds a new pool from the given environment map. Public so a module that resolves credentials elsewhere (the
+     * Registration Lambda reads them from Secrets Manager) can pass a resolved map; it owns and caches the result.
+     */
+    public static HikariDataSource create(Map<String, String> env) {
         String host = required(env, "DB_HOST");
         String name = required(env, "DB_NAME");
         String username = required(env, "DB_USERNAME");

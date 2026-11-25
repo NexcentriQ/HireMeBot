@@ -39,6 +39,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(400, "VALIDATION_ERROR", "Request validation failed", details);
     }
 
+    /** One generic answer for every authentication failure; the specific reason is only logged. */
+    public static ApiException unauthorized() {
+        return new ApiException(401, "UNAUTHORIZED", "Authentication is required.");
+    }
+
     public static ApiException forbidden(String message) {
         return new ApiException(403, "FORBIDDEN", message);
     }

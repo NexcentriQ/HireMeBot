@@ -44,6 +44,13 @@
             <artifactId>slf4j-simple</artifactId>
         </dependency>
 
+        <!-- Verifies the Cognito access token (the shared JwtAccessTokenVerifier in common; its nimbus dependency is
+             optional there, so each Lambda that verifies tokens declares it). -->
+        <dependency>
+            <groupId>com.nimbusds</groupId>
+            <artifactId>nimbus-jose-jwt</artifactId>
+        </dependency>
+
         <!-- AWS SDK v2. The lightweight URL-connection HTTP client is used so the Lambda package stays small and
              starts fast; the SDK's default Apache and Netty clients are excluded. -->
         <dependency>

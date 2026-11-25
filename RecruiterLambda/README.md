@@ -7,16 +7,19 @@ One Lambda, two routes (matched on path **and** method):
 | `POST /api/v1/recruiter/applications` | a recruiter records a job application they already made externally on behalf of an assigned student. Nothing is submitted to the job site; the details are stored in HireMeBot (MySQL) |
 | `GET /api/v1/recruiter/students` | lists the recruiter's active assigned students, to fill the Apply Job form's *Assigned Student* dropdown (see [below](#get-apiv1recruiterstudents)) |
 
-> **Security status: development only.** The recruiter is identified by the `X-Dev-Recruiter-Id` header. That is
-> **not authentication**. The header is honoured only when `ALLOW_DEV_RECRUITER_HEADER=true` (set in the local
-> `env.json`, `false` in the template), for **both** routes. Do not deploy this API publicly until Cognito/JWT
-> replaces it.
+> **Authentication.** The recruiter is identified **only** by the verified Cognito access token
+> (`Authorization: Bearer <token>`), resolved to an approved recruiter (not deleted, a `recruiters` row, not suspended, a
+> Google identity, `account_status = 'ACTIVE'`) by the shared `RecruiterAuthenticator` in `common`. The same rule serves the
+> document APIs. Nothing the client sends (`recruiterId`, user id, email) can choose the actor. A local-only fallback,
+> `X-Dev-Recruiter-Id`, works only under `sam local` with `ALLOW_DEV_RECRUITER_HEADER=true` **and no `Authorization`
+> header**; a bad token is `401` and never retried as the header, and a deployed stack ignores the header. See
+> [docs/API.md](../docs/API.md#authentication).
 
 ## Layout
 
 ```
 org.hmb
-├── handler/RecruiterLambdaHandler     route table (path + method), dev header, JSON in/out, error mapping
+├── handler/RecruiterLambdaHandler     route table (path + method), RecruiterAuthenticator (token), JSON in/out, error mapping
 ├── dto/RecruiterRequest               POST request record + validation (trim, length, URL checks)
 ├── dto/RecruiterResponse              POST success body
 ├── dto/AssignedStudentDto             one student in the GET response
@@ -24,7 +27,7 @@ org.hmb
 ├── service/ApplicationService         POST: transaction, assignment check -> document check -> insert
 ├── service/RecruiterStudentService    GET: recruiter check, then the assigned-students query (read-only)
 ├── repository/AssignmentRepository    active-assignment check (POST) and assigned-students query (GET)
-├── repository/RecruiterRepository     recruiter exists and is not soft-deleted (GET)
+├── repository/RecruiterRepository     recruiter exists, is not soft-deleted and is ACTIVE, i.e. approved (GET)
 ├── repository/ApplicationRepository   INSERT into applications (409 / 403 mapping from MySQL errors)
 ├── repository/DocumentRepository      object_store_entries lookup, application_documents insert
 └── repository/QuestionRepository      application_questions inserts
@@ -71,7 +74,8 @@ Environment variables (see `../.env.example` and `../env.json.example`):
 | `DB_PORT` | default `3306` |
 | `DB_SSL_MODE` | default `VERIFY_IDENTITY` (verified TLS). `DISABLED` only for a local MySQL without TLS |
 | `DB_TRUSTSTORE_URL`, `DB_TRUSTSTORE_PASSWORD`, `DB_TRUSTSTORE_TYPE` | only for providers with a private CA (e.g. Aiven): a PKCS12/JKS truststore holding the CA cert |
-| `ALLOW_DEV_RECRUITER_HEADER` | must be `true` to accept `X-Dev-Recruiter-Id` |
+| `COGNITO_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID` | required: the pool and app client the access token must come from (the template sets them from the `CognitoUserPoolId` / `CognitoAppClientId` parameters); a missing or inconsistent value fails closed (500) |
+| `ALLOW_DEV_RECRUITER_HEADER` | `false` (template). `true` only in the git-ignored local `env.json`, and even then honoured only under `sam local`, only without an `Authorization` header |
 
 ## Run locally
 
@@ -89,7 +93,7 @@ sam local start-api --env-vars env.json
 ```bash
 curl -i -X POST http://127.0.0.1:3000/api/v1/recruiter/applications \
   -H "Content-Type: application/json" \
-  -H "X-Dev-Recruiter-Id: 1000000001" \
+  -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN" \
   -d '{
     "studentId": 1000000002,
     "application": {
@@ -107,7 +111,7 @@ curl -i -X POST http://127.0.0.1:3000/api/v1/recruiter/applications \
 ### Postman
 
 - `POST http://127.0.0.1:3000/api/v1/recruiter/applications`
-- Headers: `Content-Type: application/json`, `X-Dev-Recruiter-Id: <recruiter user_id>`
+- Headers: `Content-Type: application/json`, `Authorization: Bearer <Cognito access token>`
 - Body: raw JSON, same as above. `recruiterId` must **not** be in the body (it is rejected with 400).
 
 Success: `201`
@@ -122,8 +126,9 @@ Errors use `{ "success": false, "error": "<CODE>", "message": "...", "details": 
 
 | Status | When |
 |---|---|
-| 400 | bad/missing field, malformed JSON, unknown field (e.g. `recruiterId`), missing/invalid dev header |
-| 403 | recruiter not assigned, user soft-deleted, resume/cover-letter object not found, dev header disabled |
+| 400 | bad/missing field, malformed JSON, unknown field (e.g. `recruiterId`); local header-only path: missing/invalid dev header |
+| 401 | no/invalid/expired/ID/foreign-pool token (never falls back to the dev header) |
+| 403 | account is not an approved recruiter, recruiter not assigned, user soft-deleted, resume/cover-letter object not found |
 | 404 / 405 | other path / other method (405 sends `Allow: POST`) |
 | 409 | the student already has an application with this job link |
 | 503 | database unreachable or pool timeout |
@@ -142,7 +147,7 @@ Lists the **active students assigned to the requesting recruiter**: those with a
 parameters. Another recruiter's students are never returned (the query filters by the recruiter from the header, and
 `UNIQUE (student_id)` means a student has exactly one recruiter).
 
-- **Request:** header `X-Dev-Recruiter-Id: <recruiter user_id>`. A `recruiterId` query parameter is ignored.
+- **Request:** header `Authorization: Bearer <Cognito access token>`. A `recruiterId` query parameter is ignored.
 - **Order:** `first_name`, then `last_name`, then `student_id`, done by MySQL (default case-insensitive collation).
 - **Fields:** `studentId`, `firstName`, `lastName`, `fullName` (trimmed names joined by one space), `email`,
   `assignedAt`. Phone, verification flags, deletion flag and manager details are deliberately not returned.
@@ -152,15 +157,15 @@ parameters. Another recruiter's students are never returned (the query filters b
 - **Logging:** only the recruiter id and the student count are logged, never names or emails.
 
 ```bash
-curl -i "http://127.0.0.1:3000/api/v1/recruiter/students" -H "Accept: application/json" -H "X-Dev-Recruiter-Id: 1000000001"
+curl -i "http://127.0.0.1:3000/api/v1/recruiter/students" -H "Accept: application/json" -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN"
 ```
 
 ```powershell
-curl.exe -i "http://127.0.0.1:3000/api/v1/recruiter/students" -H "Accept: application/json" -H "X-Dev-Recruiter-Id: 1000000001"
+curl.exe -i "http://127.0.0.1:3000/api/v1/recruiter/students" -H "Accept: application/json" -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN"
 ```
 
 Postman: `GET http://127.0.0.1:3000/api/v1/recruiter/students` with headers `Accept: application/json` and
-`X-Dev-Recruiter-Id: <recruiter user_id>`; no body.
+`Authorization: Bearer <Cognito access token>`; no body.
 
 Success: `200`
 
@@ -185,8 +190,9 @@ A recruiter with no students gets `200` with `"totalStudents": 0, "students": []
 | Status | When |
 |---|---|
 | 200 | success, including a recruiter with no assigned students |
-| 400 | missing or non-positive `X-Dev-Recruiter-Id` |
-| 403 | `ALLOW_DEV_RECRUITER_HEADER` is not `true`; recruiter does not exist, is not a recruiter, or is soft-deleted |
+| 401 | no/invalid/expired/ID/foreign-pool token (never falls back to the dev header) |
+| 400 | local header-only path: missing or non-positive `X-Dev-Recruiter-Id` |
+| 403 | the token's account is not an approved recruiter (not registered, deleted, student/manager, suspended, not Google, or `PENDING`) |
 | 404 / 405 | unknown path / other method (405 sends `Allow: GET`; `GET` on `/applications` sends `Allow: POST`) |
 | 503 | database unreachable or pool timeout |
 | 500 | anything else (details only in logs) |

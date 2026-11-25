@@ -2,6 +2,47 @@
 
 The application uses several AWS resources, including Lambda functions and an API Gateway API. These resources are defined in the `template.yaml` file in this project. You can update the template to add AWS resources through the same deployment process that updates your application code.
 
+## Database name
+
+The database is called **`hiremebot_db_v1`** (all lower case) everywhere: `hiremebot_db_V1.sql` (the V1 schema; its file
+name keeps the old capital `V1`, but the `CREATE DATABASE`/`USE` statements use the lower-case name), `.env.example`,
+`env.json.example` and the `DatabaseName` template parameter (default `hiremebot_db_v1`, lower case enforced). MySQL
+database names are case-sensitive on Linux (RDS) but not on Windows/macOS, so create the database with exactly this name
+and deploy with the same value:
+
+```bash
+sam deploy --guided --parameter-overrides DatabaseName=hiremebot_db_v1
+```
+
+To keep separate databases per environment, pass a different lower-case name (for example
+`DatabaseName=hiremebot_db_v1_staging`) and create the database under that name before loading the schema. `sam local`
+ignores the parameter: `DB_NAME` comes from your git-ignored `env.json`. Database credentials stay in `env.json`/`.env`
+for V1.
+
+## Running `sam local` against Railway MySQL
+
+`sam local` does not read `.env`; `scripts\New-SamLocalEnv.ps1` turns the git-ignored `.env` into the git-ignored
+`.sam-local\env.json` that `--env-vars` expects (nothing is printed, nothing is committed: `.env`, `env.json`,
+`.sam-local/` and `*.pem/*.p12` are in `.gitignore`). Steps (JDK 21 as `JAVA_HOME`, Docker Desktop running):
+
+1. Copy `.env.example` to `.env` and fill in `DB_HOST` (Railway public TCP proxy host), `DB_PORT` (the **external** port),
+   `DB_USERNAME`, `DB_PASSWORD`. `DB_NAME` stays `hiremebot_db_v1`.
+2. Check that all four Lambda modules connect from inside SAM Local (read-only: `SELECT 1`, `SELECT DATABASE()`):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\Test-DbConnectivity.ps1 -FetchCa
+   ```
+
+   `-FetchCa` is needed once (and after the server certificate changes): Railway's MySQL presents its own certificate, so
+   the script reads it, prints its SHA-256 fingerprint and pins it in a truststore (`DB_SSL_MODE=VERIFY_CA`). It is
+   trust-on-first-use; run it from a network you trust. TLS verification is never turned off, and the script refuses
+   `DISABLED`/`PREFERRED` for a remote host. The check uses `scripts\dbcheck\template.yaml`, a local-only template that
+   is never deployed.
+3. To run the real APIs: `sam build`, then `.\scripts\New-SamLocalEnv.ps1` (copies the truststore into the build), then
+   `sam local start-api --env-vars .sam-local\env.json`.
+
+Do not set `RUN_DB_TESTS=true` while `.env` points at Railway: several integration tests write to `DB_NAME`.
+
 ## Deploy the sample application
 
 The Serverless Application Model Command Line Interface (SAM CLI) is an extension of the AWS CLI that adds functionality for building and testing Lambda applications. It uses Docker to run your functions in an Amazon Linux environment that matches Lambda. It can also emulate your application's build environment and API.

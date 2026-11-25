@@ -27,8 +27,6 @@ class DocumentUploadConfigTest {
         assertEquals(5L * 1024 * 1024, config.policy(DocumentType.RESUME).maxSizeBytes());
         assertEquals(300, config.urlExpirySeconds());
         assertEquals(1800, config.tokenTtlSeconds());
-        assertEquals(5, config.reconcileLookbackDays());
-        assertEquals(500, config.reconcileBatchSize());
     }
 
     @Test
@@ -71,9 +69,7 @@ class DocumentUploadConfigTest {
                 Map.of("UPLOAD_URL_EXPIRY_SECONDS", "abc"),
                 Map.of("UPLOAD_URL_EXPIRY_SECONDS", "99999"),
                 Map.of("UPLOAD_TOKEN_TTL_SECONDS", "5"),
-                Map.of("DOCUMENT_COVER_LETTER_ENABLED", "yes"),
-                Map.of("RECONCILE_LOOKBACK_DAYS", "7"),        // must stay below the 7-day pending expiry
-                Map.of("RECONCILE_BATCH_SIZE", "0"))) {
+                Map.of("DOCUMENT_COVER_LETTER_ENABLED", "yes"))) {
             IllegalStateException e = assertThrows(IllegalStateException.class, () -> config(bad),
                     "should reject " + bad);
             assertTrue(e.getMessage().contains(bad.keySet().iterator().next()));

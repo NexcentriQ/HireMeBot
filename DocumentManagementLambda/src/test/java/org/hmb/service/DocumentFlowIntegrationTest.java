@@ -11,10 +11,8 @@ import org.hmb.repository.DocumentRepository;
 import org.hmb.repository.RecruiterAccessRepository;
 import org.hmb.security.SigningSecretProvider;
 import org.hmb.security.UploadTokenService;
-import org.hmb.service.DocumentReconciliationService.Result;
 import org.hmb.service.DocumentUploadService.RegisterOutcome;
 import org.hmb.storage.S3DocumentStorageService;
-import org.hmb.storage.S3DocumentStorageService.ObjectState;
 import org.hmb.storage.S3DocumentStorageService.PresignedUpload;
 import org.hmb.storage.S3DocumentStorageService.StoredObject;
 import org.junit.jupiter.api.AfterEach;
@@ -57,7 +55,6 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -166,6 +163,31 @@ class DocumentFlowIntegrationTest {
 
         assertEquals(403, assertThrows(ApiException.class, () -> service.registerDocument(register, a.recruiterA())).getStatusCode());
         assertEquals(0, rowCount(a.studentOfA()));
+    }
+
+    /**
+     * New recruiters register as PENDING and only become ACTIVE through the operator's manual UPDATE. A pending or
+     * suspended recruiter can neither get an upload URL nor register a document; an approved one can.
+     */
+    @Test
+    void aPendingOrSuspendedRecruiterCanNeitherRequestAnUploadUrlNorRegister() throws SQLException {
+        Actors a = actors();
+        RegisterRequest register = prepareUpload(a.studentOfA(), a.recruiterA(), randomSha());   // prepared while ACTIVE
+
+        for (String status : new String[] {"PENDING", "SUSPENDED"}) {
+            setAccountStatus(a.recruiterA(), status);
+            assertEquals(403, assertThrows(ApiException.class,
+                    () -> service.requestUploadUrl(request(a.studentOfA(), randomSha()), a.recruiterA())).getStatusCode(),
+                    status);
+            assertEquals(403, assertThrows(ApiException.class,
+                    () -> service.registerDocument(register, a.recruiterA())).getStatusCode(), status);
+            assertEquals(0, rowCount(a.studentOfA()), status);
+        }
+
+        setAccountStatus(a.recruiterA(), "ACTIVE");   // what the manual approval does
+        assertEquals("UPLOAD_REQUIRED",
+                service.requestUploadUrl(request(a.studentOfA(), randomSha()), a.recruiterA()).status());
+        assertTrue(service.registerDocument(register, a.recruiterA()).created());
     }
 
     // ---- registration and the duplicate rules (UNIQUE(hashed_value) is global) ---------------------------------
@@ -330,44 +352,6 @@ class DocumentFlowIntegrationTest {
         }
     }
 
-    // ---- reconciliation against real rows -----------------------------------------------------------------------
-
-    @Test
-    void theReconcilerRetagsAnObjectWhoseRowExistsButIsStillPending() throws SQLException {
-        Actors a = actors();
-        String key = "students/" + a.studentOfA() + "/resumes/" + UUID.randomUUID() + ".pdf";
-        insertRow(a.studentOfA(), "RESUME", key, randomSha());
-        when(storage.state(anyString())).thenReturn(ObjectState.REGISTERED);
-        when(storage.state(key)).thenReturn(ObjectState.PENDING);
-        DocumentReconciliationService reconciler = new DocumentReconciliationService(dataSource,
-                DocumentUploadConfig.fromEnv(Map.of()), documents, storage, Clock.systemUTC());
-
-        Result result = reconciler.reconcile(() -> 600_000);
-
-        assertTrue(result.healed() >= 1);
-        verify(storage).markRegistered(key);
-        // It only ever heals: no row is created or removed by the reconciler.
-        assertEquals(1, rowCount(a.studentOfA()));
-    }
-
-    @Test
-    void theReconcilerReportsARowWhoseObjectIsMissing() throws SQLException {
-        Actors a = actors();
-        String key = "students/" + a.studentOfA() + "/resumes/" + UUID.randomUUID() + ".pdf";
-        insertRow(a.studentOfA(), "RESUME", key, randomSha());
-        when(storage.state(anyString())).thenReturn(ObjectState.REGISTERED);
-        when(storage.state(key)).thenReturn(ObjectState.MISSING);
-        DocumentReconciliationService reconciler = new DocumentReconciliationService(dataSource,
-                DocumentUploadConfig.fromEnv(Map.of()), documents, storage, Clock.systemUTC());
-
-        Result result = reconciler.reconcile(() -> 600_000);
-
-        assertTrue(result.missing() >= 1);
-        assertTrue(result.needsAttention());
-        verify(storage, never()).markRegistered(key);
-        assertEquals(1, rowCount(a.studentOfA()), "nothing is deleted or repaired automatically");
-    }
-
     // ---- helpers ------------------------------------------------------------------------------------------------
 
     private <T> List<T> runConcurrently(int threads, Callable<T> task) throws Exception {
@@ -470,11 +454,22 @@ class DocumentFlowIntegrationTest {
         }
     }
 
+    private static void setAccountStatus(long userId, String status) throws SQLException {
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement("UPDATE users SET account_status = ? WHERE user_id = ?")) {
+            ps.setString(1, status);
+            ps.setLong(2, userId);
+            assertEquals(1, ps.executeUpdate());
+        }
+    }
+
     private static long insertUser(Connection c) throws SQLException {
         String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         String phone = "9" + (100000000 + ThreadLocalRandom.current().nextInt(900000000));
         try (PreparedStatement ps = c.prepareStatement(
-                "INSERT INTO users (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)",
+                // The schema default is PENDING (an unapproved recruiter); the fixtures are approved (ACTIVE) users.
+                "INSERT INTO users (first_name, last_name, email, phone, account_status) "
+                        + "VALUES (?, ?, ?, ?, 'ACTIVE')",
                 Statement.RETURN_GENERATED_KEYS)) {
             ps.setString(1, "it" + suffix);
             ps.setString(2, "user" + suffix);

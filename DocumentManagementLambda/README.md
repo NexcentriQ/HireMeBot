@@ -2,34 +2,33 @@
 
 Resume upload for HireMeBot: a recruiter uploads a student's resume **straight from the browser to a private S3
 bucket**, and the document is registered in MySQL (`object_store_entries`) so its `object_id` can later be attached to
-an application. Two API routes bracket the upload, and one scheduled job keeps S3 and MySQL consistent.
+an application. Two API routes bracket the upload. There is no scheduled job and no automatic cleanup in V1.
 
 | Piece | What it is |
 |---|---|
 | `POST /api/v1/documents/upload-url` | duplicate check + presigned S3 PUT. Writes nothing |
 | `POST /api/v1/documents/register` | verifies the uploaded object, then inserts the row |
-| `DocumentReconciliationFunction` | EventBridge schedule (not an API). Heals S3/MySQL gaps. Never deletes |
 
 Full request/response/error reference: [`docs/API.md`](../docs/API.md) (endpoints 4 and 5). A paste-ready prompt for the
 frontend: [`docs/FRONTEND_RESUME_UPLOAD_PROMPT.md`](../docs/FRONTEND_RESUME_UPLOAD_PROMPT.md).
 
-> ## Before this is exposed: production authentication is a prerequisite
-> Authentication today is development-only. The recruiter is identified by `X-Dev-Recruiter-Id`, and the code accepts
-> that header **only when `ALLOW_DEV_RECRUITER_HEADER=true` and the process runs under `sam local`**
-> (`AWS_SAM_LOCAL=true`, set by the SAM CLI and never by AWS). In any deployed Lambda the header can never authorize a
-> request, even if the flag is set by mistake, so **a deployed stack answers `403` to every document call until
-> production authentication exists.** That is intended.
+> ## Authentication
+> The recruiter is identified **only** by the verified Cognito access token (`Authorization: Bearer <token>`), resolved to an
+> approved recruiter (not deleted, a `recruiters` row, not suspended, a Google identity, `account_status = 'ACTIVE'`) by the
+> shared `RecruiterAuthenticator` in `common`; both routes also sit behind the API Gateway JWT authorizer
+> (`CognitoAccessToken`, scope `openid`). Nothing the client sends (`recruiterId`, user id, email) can choose the actor.
 >
-> Before these APIs are used outside local development, implement production authentication: a validated Cognito/JWT
-> identity (for example an HttpApi JWT authorizer) mapped to a `recruiters.recruiter_id`. It replaces only
-> `DocumentLambdaHandler.resolveRecruiter`. Do not expose the APIs before then.
+> `X-Dev-Recruiter-Id` is a local-only fallback: honoured only when `ALLOW_DEV_RECRUITER_HEADER=true`, the process runs
+> under `sam local` (`AWS_SAM_LOCAL=true`, set by the SAM CLI and never by AWS) **and the request has no `Authorization`
+> header**. A bad token is `401` and is never retried as the header; a deployed stack ignores the header even if the flag is
+> set by mistake. See [docs/API.md](../docs/API.md#authentication).
 
 ## How it works
 
 ```
 Browser                         API (this Lambda)                 S3 (private)            MySQL
   | SHA-256(file bytes)               |                                |                     |
-  |--- upload-url ------------------->| authorize (active recruiter,   |                     |
+  |--- upload-url ------------------->| authorize (ACTIVE recruiter,   |                     |
   |                                   |   assigned to student)         |                     |
   |                                   | findByChecksum --------------------------------------> |
   |<-- ALREADY_EXISTS (objectId) -----|   same student+type: HEAD ---->|                     |
@@ -69,37 +68,27 @@ Browser                         API (this Lambda)                 S3 (private)  
 
 ## Consistency between S3 and MySQL
 
-**MySQL is the source of truth. The S3 tag `doc-state` is only a derived marker, and the safe direction of failure is
-"the object stays expirable until the database says otherwise".** Registration is `verify -> INSERT -> tag registered`.
+**MySQL is the source of truth. The S3 tag `doc-state` is only a derived marker.** Registration is
+`verify -> INSERT -> tag registered`.
 
-Every upload is tagged `doc-state=pending` by the signed URL. A bucket lifecycle rule expires **only** `pending`
-objects, after 7 days. Registration retags the object `registered`, which the rule ignores. **No code in the system
-deletes an object:** no Lambda has `s3:DeleteObject`, and the reconciler only retags.
+Every upload is tagged `doc-state=pending` by the signed URL; registration retags it `registered`. **Nothing in V1
+deletes or expires an object:** the bucket has no lifecycle rules and no versioning, and no Lambda has
+`s3:DeleteObject`. The tags exist so that a future, manually invoked cleanup tool can find abandoned uploads; see
+[`docs/DOCUMENT_CLEANUP_DESIGN.md`](../docs/DOCUMENT_CLEANUP_DESIGN.md). Not implemented yet.
 
-| Failure | State left | How it heals |
+| Failure | State left | What happens |
 |---|---|---|
-| PUT fails or is abandoned | nothing, or a `pending` object | `pending` expires in 7 days |
-| `register` fails before the insert (verification, database down) | no row, object `pending` | the client retries `register` (token valid 30 min); otherwise it expires. No leak |
-| INSERT succeeds, then tagging fails or the Lambda dies | **row exists, object still `pending`** | (a) a client replay of `register` finds the row and re-applies the tag; (b) the reconciler retags it within hours; (c) bucket versioning keeps the file recoverable for 30 days even if expiry ever fired |
+| PUT fails or is abandoned | nothing, or a `pending` object | the `pending` object stays in S3 (a cleanup candidate after 7 days once the cleanup tool exists) |
+| `register` fails before the insert (verification, database down) | no row, object `pending` | the client retries `register` (token valid 30 min); otherwise the object stays `pending` as above. No row is ever leaked |
+| INSERT succeeds, then tagging fails or the Lambda dies | **row exists, object still `pending`** | the document is registered and usable. A client replay of `register` finds the row and re-applies the tag. If nobody replays, the tag stays `pending`: harmless, because nothing acts on it automatically. **A `pending` tag alone never means "abandoned"**; any cleanup must check MySQL |
 | Response lost after a successful insert | row and tag fine | replay returns the same `objectId` (`200`) |
-| Two uploaders, identical bytes, concurrently | winner has a row; loser's object has none | loser gets `409` (or the existing id if it is the same student); loser's object stays `pending` and expires |
-| Row exists, S3 object missing | inconsistent | reported by the reconciler (ERROR log with the document id only) and as `409 DOCUMENT_UNAVAILABLE`. **Not repaired automatically**: there is no delete or replace path |
+| Two uploaders, identical bytes, concurrently | winner has a row; loser's object has none | loser gets `409` (or the existing id if it is the same student); loser's object stays `pending` |
+| Row exists, S3 object missing | inconsistent | `409 DOCUMENT_UNAVAILABLE` on `upload-url`/`register` (ERROR log with the document id only). **Not repaired automatically** |
 
 A tagging error **after** a successful insert never fails the request, because the row is authoritative.
 
-### The reconciler
-
-Runs on `ReconcileSchedule` (default `rate(3 hours)`). It reads rows created within the last
-`RECONCILE_LOOKBACK_DAYS` (5, always less than the 7-day expiry) in keyset batches (**SELECT only**), checks each
-object's tag, and retags `pending` ones `registered`. It never deletes and never writes to MySQL, and retagging is
-idempotent, so it can overlap with the API and with other runs. It stops early when the Lambda is near its time limit
-and the next run starts over. A run that finds a missing file, cannot check a row, or cannot finish **fails the
-invocation**, so the `DocumentReconciliationErrorsAlarm` fires (set `AlarmTopicArn` to be notified) and Lambda retries it.
-
-**If the alarm fires:** open the function's logs. `has a row but its S3 object is missing` names a document id. Check the
-bucket (it is versioned: an expired object leaves a delete marker, and the file stays recoverable for 30 days by
-removing the marker). Rows whose file is gone cannot be re-uploaded because their checksum is unique, so recover the
-file from the old version or from the student.
+There is no longer a scheduled reconciler (removed for V1 simplicity), so nothing retags `registered-but-pending`
+objects in the background. Without a lifecycle rule that is safe: such an object is never expired.
 
 ## File validation, and its limits
 
@@ -130,25 +119,23 @@ an invalid value fails fast naming the variable, never its value.
 | `UPLOAD_TOKEN_TTL_SECONDS` | 1800 | upload-intent token lifetime (60 to 86400) |
 | `DOCUMENT_RESUME_ENABLED` / `_MAX_SIZE_MB` | true / 5 | |
 | `DOCUMENT_COVER_LETTER_ENABLED` / `_MAX_SIZE_MB` | **false** / 5 | defined, not enabled in V1; no cover-letter workflow exists |
-| `RECONCILE_LOOKBACK_DAYS`, `RECONCILE_BATCH_SIZE` | 5, 500 | lookback must stay under the 7-day expiry (max 6 enforced) |
 | `ALLOW_DEV_RECRUITER_HEADER` | `"false"` | local development only; see the banner above |
+| `COGNITO_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID` | from the template parameters | the pool and app client the access token must come from; a missing or inconsistent value fails closed (500) |
 
 Allowed files are fixed in code: `.pdf` and `.docx`, each with exactly one accepted MIME type.
 
 ## Infrastructure (in the root `template.yaml`)
 
-- `DocumentsBucket`: private (all four public-access blocks), SSE-S3, `BucketOwnerEnforced`, **versioned**, `Retain`.
-  Lifecycle: expire `doc-state=pending` after 7 days (noncurrent versions 30 days); abort incomplete multipart uploads
-  after 1 day. CORS: `PUT` from the one `PortalOrigin` only, with the explicit headers `content-type`,
-  `x-amz-checksum-sha256`, `x-amz-tagging`.
+- `DocumentsBucket`: private (all four public-access blocks), SSE-S3 (`AES256`), `BucketOwnerEnforced`, `Retain`.
+  **No versioning and no lifecycle rules**, so S3 never expires or deletes anything. CORS: `PUT` from the one
+  `PortalOrigin` only, with the explicit headers `content-type`, `x-amz-checksum-sha256`, `x-amz-tagging`.
 - `DocumentsBucketPolicy`: denies any non-TLS request.
 - `UploadSigningSecret`: generated by Secrets Manager.
 - `DocumentManagementFunction`: IAM = `s3:PutObject` + `s3:PutObjectTagging` + `s3:GetObject` on `students/*`,
   `s3:ListBucket` on the bucket, `secretsmanager:GetSecretValue` on the one secret.
   (`ListBucket` is needed so a missing key is a `404` instead of a `403`; it has no prefix condition because that
   condition key does not apply to `HeadObject`. The bucket holds only documents and the code never lists it.)
-- `DocumentReconciliationFunction` (+ `DocumentReconciliationErrorsAlarm`): `s3:GetObjectTagging` + `s3:PutObjectTagging`
-  on `students/*`, `s3:ListBucket`. **No function has `s3:DeleteObject`.**
+- **No function has `s3:DeleteObject`.** There is no scheduled function, no alarm and no EventBridge rule.
 - `PortalOrigin` (parameter, one explicit origin, no wildcard) is also the only origin allowed by CORS on the shared HTTP
   API. Adding it to the HTTP API's CORS also adds CORS headers to the existing Recruiter and Student routes.
 
@@ -181,7 +168,8 @@ Real uploads need a real S3 bucket (there is no S3 emulator here) and AWS creden
    portal origin (`PortalOrigin` parameter).
 2. Add a `DocumentManagementFunction` block to `env.json` (see `env.json.example`): the DB values, `DOCUMENTS_BUCKET`,
    `UPLOAD_SIGNING_SECRET_ID: ""`, `UPLOAD_TOKEN_SECRET_DEV` (any 32+ characters), and
-   `ALLOW_DEV_RECRUITER_HEADER: "true"`.
+   `ALLOW_DEV_RECRUITER_HEADER: "true"` (only if you want to test with the header instead of a Cognito token; a token
+   always wins over the header).
 3. `sam local start-api --env-vars env.json --profile <aws-profile>` (the profile supplies credentials for presigning).
 
 Manual sequence (Git Bash; needs `jq`, `curl`, `sha256sum`):
@@ -210,23 +198,24 @@ of the file after hashing (S3 rejects the PUT with a checksum error).
 
 ## Deploy (not done by the build; run it yourself)
 
-Prerequisites: the database has `object_store_entries.document_type`; **production authentication exists** (otherwise the
-deployed document APIs answer `403`, by design); you know the portal's origin.
+Prerequisites: the database has `object_store_entries.document_type`; the Cognito pool, app client and `PortalOrigin` are
+known (the template parameters `CognitoUserPoolId`, `CognitoAppClientId`, `PortalOrigin`); you know the portal's origin.
 
 ```bash
 mvn clean install -DskipTests
 sam build
-sam deploy --guided --parameter-overrides PortalOrigin=https://portal.example.com [AlarmTopicArn=arn:aws:sns:...]
+sam deploy --guided --parameter-overrides PortalOrigin=https://portal.example.com DatabaseName=hiremebot_db_v1
 ```
 
-After deploying, check: the bucket's public-access blocks are on, the lifecycle rules and CORS are present, the secret
-exists, and the reconciler's schedule is enabled.
+After deploying, check: the bucket's public-access blocks are on, CORS is present, there are **no** lifecycle rules,
+versioning is off, and the secret exists. Review the change set before executing it (`confirm_changeset = true` in
+`samconfig.toml`).
 
 ## Known limitations
 
 No malware scanning and only basic format checks (see above). A recruiter can infer that identical bytes exist elsewhere
 (inherent to global uniqueness; the message is generic and names no student, key or id). A row whose object was lost is
-reported but not auto-repaired. Hard-deleting a student cascades its rows in MySQL but leaves registered S3 objects (there
-is no delete path in V1). The reconciler makes one tagging call per recent row per run, fine for V1 volumes (S3
-Inventory is the upgrade path). The token-signing secret has no rotation or key id. `COVER_LETTER` has policy and a
+reported but not auto-repaired. Abandoned `pending` uploads accumulate in S3 until the manual cleanup tool exists
+(see the cleanup design). Without versioning, a deleted or overwritten object cannot be recovered. Hard-deleting a
+student cascades its rows in MySQL but leaves registered S3 objects (there is no delete path in V1). The token-signing secret has no rotation or key id. `COVER_LETTER` has policy and a
 disabled flag but no workflow. No get, download or delete API exists.

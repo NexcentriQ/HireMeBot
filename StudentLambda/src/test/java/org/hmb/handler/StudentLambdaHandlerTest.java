@@ -266,10 +266,13 @@ class StudentLambdaHandlerTest {
     }
 
     @Test
-    void devHeaderIsRejectedWhenNotEnabled() {
+    void devHeaderIsRejectedWhenNotPermitted() throws Exception {
         handler = new StudentLambdaHandler(service, false);
 
-        assertEquals(403, get(studentHeader("1000000002")).getStatusCode());
+        APIGatewayV2HTTPResponse response = get(studentHeader("1000000002"));
+
+        assertEquals(401, response.getStatusCode());
+        assertEquals("UNAUTHORIZED", JSON.readTree(response.getBody()).get("error").asText());
         verifyNoInteractions(service);
     }
 

@@ -12,6 +12,7 @@
         <module>RecruiterLambda</module>
         <module>StudentLambda</module>
         <module>DocumentManagementLambda</module>
+        <module>Registration</module>
     </modules>
 
     <properties>
@@ -67,6 +68,12 @@
                 <groupId>com.mysql</groupId>
                 <artifactId>mysql-connector-j</artifactId>
                 <version>8.4.0</version>
+            </dependency>
+            <!-- JWT/JWS verification of Cognito access tokens (Registration). No mandatory transitive dependencies. -->
+            <dependency>
+                <groupId>com.nimbusds</groupId>
+                <artifactId>nimbus-jose-jwt</artifactId>
+                <version>10.10</version>
             </dependency>
             <dependency>
                 <groupId>org.slf4j</groupId>

@@ -1,0 +1,464 @@
+{
+  "info": {
+    "name": "HireMeBot - Student dashboard API (Cognito access token)",
+    "description": "Student Dashboard API, authenticated with the Cognito ACCESS token (no student id is ever sent):\n  GET /api/v1/student/applications\n\nEnvironment variables\n  BASE_URL                          http://127.0.0.1:3000 for sam local, or the deployed API URL\n  COGNITO_ACCESS_TOKEN              SECRET. Access token of an ACTIVE student (current value only; never commit or share it)\nOptional (requests that need them are skipped when empty)\n  OTHER_STUDENT_ID                  the id of a DIFFERENT student than the token owner\n  COGNITO_ACCESS_TOKEN_PENDING      SECRET. Token of a student whose account is PENDING\n  COGNITO_ACCESS_TOKEN_SUSPENDED    SECRET. Token of a SUSPENDED student\n  COGNITO_ACCESS_TOKEN_RECRUITER    SECRET. Token of a Google account registered as a recruiter\n  COGNITO_ID_TOKEN                  SECRET. The ID token of any user (must be rejected)\n\nHow to get a token: sign in to the portal with Continue with Google, then in the browser console run\n  (await fetchAuthSession()).tokens.accessToken.toString()\nand paste the result straight into the variable's current value. It expires after 60 minutes.\n\nExpected results: 200 for an ACTIVE student reading their own data; 401 for no, invalid, tampered or ID token (never a\nfallback to X-Dev-Student-Id); 403 for PENDING, SUSPENDED, deleted or non-student accounts; 400 for deprecated parameters.\nDeployed, API Gateway answers a missing or invalid token with {\"message\":\"Unauthorized\"} before the Lambda, so those tests\naccept both bodies. X-Dev-Student-Id works only under sam local with ALLOW_DEV_STUDENT_HEADER=true and no Authorization header.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Active student: own dashboard (200)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "No student id is sent: the student is resolved from the verified access token.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{COGNITO_ACCESS_TOKEN}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 with the unchanged dashboard response format', () => {",
+              "  pm.response.to.have.status(200);",
+              "  const json = pm.response.json();",
+              "  pm.expect(Object.keys(json)).to.eql(['success', 'data']);",
+              "  pm.expect(json.success).to.eql(true);",
+              "  pm.expect(Object.keys(json.data)).to.eql(['studentId','date','student','totalApplications','pageSize','totalPages','pages','statistics']);",
+              "  pm.expect(Object.keys(json.data.student)).to.eql(['firstName','lastName','email','phoneE164','phoneVerified']);",
+              "  pm.expect(Object.keys(json.data.statistics)).to.eql(['asOfDate','timezone','monthlyProgress','todayProgress','weeklyActivity']);",
+              "  pm.collectionVariables.set('actingStudentId', String(json.data.studentId));",
+              "});",
+              "pm.test('No server internals, credentials or tokens in the body', () => {",
+              "  const body = pm.response.text();",
+              "  ['jdbc:','SQLException','at org.hmb','password','eyJ'].forEach(s => pm.expect(body).to.not.include(s));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Active student: client-supplied student id is ignored (own data)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Dev-Student-Id",
+            "value": "{{OTHER_STUDENT_ID}}"
+          }
+        ],
+        "url": "{{BASE_URL}}/api/v1/student/applications?studentId={{OTHER_STUDENT_ID}}",
+        "description": "Sends another student's id in X-Dev-Student-Id and in a studentId query parameter. The Authorization header wins; the response must still be the token owner's. The extra studentId query parameter is not one of the rejected deprecated parameters.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{COGNITO_ACCESS_TOKEN}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "(() => {",
+              "  if (!pm.variables.get('OTHER_STUDENT_ID')) {",
+              "    pm.test.skip('Set OTHER_STUDENT_ID to run this request');",
+              "    return;",
+              "  }",
+              "  pm.test('Own data only: an id sent by the client is ignored', () => {",
+              "    pm.response.to.have.status(200);",
+              "    const id = String(pm.response.json().data.studentId);",
+              "    pm.expect(id).to.not.eql(pm.variables.get('OTHER_STUDENT_ID'));",
+              "    const own = pm.collectionVariables.get('actingStudentId');",
+              "    if (own) pm.expect(id).to.eql(own);",
+              "  });",
+              "})();"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "No token (401)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "Deployed, API Gateway rejects this before the Lambda. Under sam local the Lambda answers 401 UNAUTHORIZED.",
+        "auth": {
+          "type": "noauth"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('401: no credentials', () => {",
+              "  pm.response.to.have.status(401);",
+              "  const text = pm.response.text();",
+              "  // Deployed, API Gateway answers a bad/missing token with {\"message\":\"Unauthorized\"} before the Lambda.",
+              "  const json = pm.response.json();",
+              "  const lambda = json.success === false && [\"UNAUTHORIZED\"].includes(json.error);",
+              "  const gateway = json.message === 'Unauthorized';",
+              "  pm.expect(lambda || gateway).to.eql(true);",
+              "  ['jdbc:','SQLException','at org.hmb','password','eyJ'].forEach(s => pm.expect(text).to.not.include(s));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Invalid token (401)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Dev-Student-Id",
+            "value": "{{OTHER_STUDENT_ID}}"
+          }
+        ],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "A malformed Bearer token must never fall back to the development header, even when one is sent.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{INVALID_TOKEN}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('401: invalid token, no fallback to X-Dev-Student-Id', () => {",
+              "  pm.response.to.have.status(401);",
+              "  const text = pm.response.text();",
+              "  // Deployed, API Gateway answers a bad/missing token with {\"message\":\"Unauthorized\"} before the Lambda.",
+              "  const json = pm.response.json();",
+              "  const lambda = json.success === false && [\"UNAUTHORIZED\"].includes(json.error);",
+              "  const gateway = json.message === 'Unauthorized';",
+              "  pm.expect(lambda || gateway).to.eql(true);",
+              "  ['jdbc:','SQLException','at org.hmb','password','eyJ'].forEach(s => pm.expect(text).to.not.include(s));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Tampered token (401)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "The valid token with its signature altered.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{TAMPERED_TOKEN}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "(() => {",
+              "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN')) { pm.test.skip('Set COGNITO_ACCESS_TOKEN to run this request'); return; }",
+              "  pm.test('401: bad signature', () => {",
+              "    pm.response.to.have.status(401);",
+              "    const text = pm.response.text();",
+              "    // Deployed, API Gateway answers a bad/missing token with {\"message\":\"Unauthorized\"} before the Lambda.",
+              "    const json = pm.response.json();",
+              "    const lambda = json.success === false && [\"UNAUTHORIZED\"].includes(json.error);",
+              "    const gateway = json.message === 'Unauthorized';",
+              "    pm.expect(lambda || gateway).to.eql(true);",
+              "    ['jdbc:','SQLException','at org.hmb','password','eyJ'].forEach(s => pm.expect(text).to.not.include(s));",
+              "  });",
+              "})();"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Cognito ID token instead of access token (401)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "Only the access token is accepted.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{COGNITO_ID_TOKEN}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "(() => {",
+              "  if (!pm.variables.get('COGNITO_ID_TOKEN')) {",
+              "    pm.test.skip('Set COGNITO_ID_TOKEN to run this request');",
+              "    return;",
+              "  }",
+              "  pm.test('401: ID token rejected', () => {",
+              "    pm.response.to.have.status(401);",
+              "    const text = pm.response.text();",
+              "    // Deployed, API Gateway answers a bad/missing token with {\"message\":\"Unauthorized\"} before the Lambda.",
+              "    const json = pm.response.json();",
+              "    const lambda = json.success === false && [\"UNAUTHORIZED\"].includes(json.error);",
+              "    const gateway = json.message === 'Unauthorized';",
+              "    pm.expect(lambda || gateway).to.eql(true);",
+              "    ['jdbc:','SQLException','at org.hmb','password','eyJ'].forEach(s => pm.expect(text).to.not.include(s));",
+              "  });",
+              "})();"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "PENDING student token (403)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "Account not yet ACTIVE.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{COGNITO_ACCESS_TOKEN_PENDING}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "(() => {",
+              "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_PENDING')) {",
+              "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_PENDING to run this request');",
+              "    return;",
+              "  }",
+              "  pm.test('403 FORBIDDEN: the account is not ACTIVE', () => {",
+              "    pm.response.to.have.status(403);",
+              "    const json = pm.response.json();",
+              "    pm.expect(json.success).to.eql(false);",
+              "    pm.expect(json.error).to.eql('FORBIDDEN');",
+              "    pm.expect(json.message).to.be.a('string');",
+              "  });",
+              "})();"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "SUSPENDED student token (403)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "SUSPENDED accounts lose access immediately, even with an unexpired token.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{COGNITO_ACCESS_TOKEN_SUSPENDED}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "(() => {",
+              "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_SUSPENDED')) {",
+              "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_SUSPENDED to run this request');",
+              "    return;",
+              "  }",
+              "  pm.test('403 FORBIDDEN: a suspended account', () => {",
+              "    pm.response.to.have.status(403);",
+              "    const json = pm.response.json();",
+              "    pm.expect(json.success).to.eql(false);",
+              "    pm.expect(json.error).to.eql('FORBIDDEN');",
+              "    pm.expect(json.message).to.be.a('string');",
+              "  });",
+              "})();"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Recruiter token (403)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications",
+        "description": "A Google account registered as a recruiter has no students row.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{COGNITO_ACCESS_TOKEN_RECRUITER}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "(() => {",
+              "  if (!pm.variables.get('COGNITO_ACCESS_TOKEN_RECRUITER')) {",
+              "    pm.test.skip('Set COGNITO_ACCESS_TOKEN_RECRUITER to run this request');",
+              "    return;",
+              "  }",
+              "  pm.test('403 FORBIDDEN: a recruiter is not a student', () => {",
+              "    pm.response.to.have.status(403);",
+              "    const json = pm.response.json();",
+              "    pm.expect(json.success).to.eql(false);",
+              "    pm.expect(json.error).to.eql('FORBIDDEN');",
+              "    pm.expect(json.message).to.be.a('string');",
+              "  });",
+              "})();"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Deprecated query parameters (400)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{BASE_URL}}/api/v1/student/applications?date=2025-01-01&page=2",
+        "description": "date, startDate, endDate, month, week, page and size are no longer accepted.",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{COGNITO_ACCESS_TOKEN}}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400 BAD_REQUEST: deprecated date/pagination parameters are rejected', () => {",
+              "  pm.response.to.have.status(400);",
+              "  const json = pm.response.json();",
+              "  pm.expect(json.success).to.eql(false);",
+              "  pm.expect(json.error).to.eql('BAD_REQUEST');",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "const t = pm.variables.get('COGNITO_ACCESS_TOKEN');",
+          "pm.collectionVariables.set('TAMPERED_TOKEN', t ? t.slice(0, -4) + (t.endsWith('AAAA') ? 'BBBB' : 'AAAA') : '');",
+          "pm.collectionVariables.set('INVALID_TOKEN', 'not.a.jwt');"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('JSON error envelope on failures', () => {",
+          "  if (pm.response.code >= 400) {",
+          "    const json = pm.response.json();",
+          "    pm.expect(json.success === false || json.message !== undefined).to.eql(true);",
+          "  }",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "actingStudentId",
+      "value": ""
+    },
+    {
+      "key": "TAMPERED_TOKEN",
+      "value": ""
+    },
+    {
+      "key": "INVALID_TOKEN",
+      "value": ""
+    }
+  ]
+}

@@ -178,6 +178,36 @@ class RecruiterStudentsIntegrationTest {
         assertEquals(403, e.getStatusCode());
     }
 
+    /**
+     * New recruiters register as PENDING and only become ACTIVE through the operator's manual UPDATE; until then they
+     * must see nothing. (The fixtures are approved recruiters; this one is moved back to PENDING and then approved.)
+     */
+    @Test
+    void aPendingRecruiterIs403UntilApproved() throws SQLException {
+        long manager = newManager();
+        long recruiter = newRecruiter(manager);
+        long student = newStudent("p" + suffix(), "x");
+        assign(recruiter, student, manager);
+        assertEquals(List.of(student), ids(service.getAssignedStudents(recruiter).data()));
+
+        setAccountStatus(recruiter, "PENDING");
+        assertEquals(403, assertThrows(ApiException.class, () -> service.getAssignedStudents(recruiter)).getStatusCode());
+
+        setAccountStatus(recruiter, "ACTIVE");   // what the manual approval does
+        assertEquals(List.of(student), ids(service.getAssignedStudents(recruiter).data()));
+    }
+
+    @Test
+    void aSuspendedRecruiterIs403() throws SQLException {
+        long manager = newManager();
+        long recruiter = newRecruiter(manager);
+        long student = newStudent("s" + suffix(), "x");
+        assign(recruiter, student, manager);
+        setAccountStatus(recruiter, "SUSPENDED");
+
+        assertEquals(403, assertThrows(ApiException.class, () -> service.getAssignedStudents(recruiter)).getStatusCode());
+    }
+
     @Test
     void nonexistentRecruiterIs403() {
         ApiException e = assertThrows(ApiException.class, () -> service.getAssignedStudents(Long.MAX_VALUE));
@@ -273,6 +303,15 @@ class RecruiterStudentsIntegrationTest {
         }
     }
 
+    private void setAccountStatus(long userId, String status) throws SQLException {
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement("UPDATE users SET account_status = ? WHERE user_id = ?")) {
+            ps.setString(1, status);
+            ps.setLong(2, userId);
+            assertEquals(1, ps.executeUpdate());
+        }
+    }
+
     private void softDelete(long userId) throws SQLException {
         try (Connection c = dataSource.getConnection()) {
             execute(c, "UPDATE users SET is_deleted = TRUE WHERE user_id = ?", userId);
@@ -283,7 +322,9 @@ class RecruiterStudentsIntegrationTest {
         String unique = suffix();
         String phone = "9" + (100000000 + ThreadLocalRandom.current().nextInt(900000000));
         try (PreparedStatement ps = c.prepareStatement(
-                "INSERT INTO users (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)",
+                // The schema default is PENDING (an unapproved recruiter); the fixtures are approved (ACTIVE) users.
+                "INSERT INTO users (first_name, last_name, email, phone, account_status) "
+                        + "VALUES (?, ?, ?, ?, 'ACTIVE')",
                 Statement.RETURN_GENERATED_KEYS)) {
             ps.setString(1, firstName);
             ps.setString(2, lastName);

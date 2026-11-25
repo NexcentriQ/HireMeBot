@@ -1,0 +1,255 @@
+{
+  "info": {
+    "name": "HireMeBot - Student sign-in (Continue with Google) and registration",
+    "description": "GET /api/v1/auth/me and POST /api/v1/students/register. Use a Postman environment with `baseUrl` (http://127.0.0.1:3000 for sam local) and the SECRET variable `cognitoAccessToken` (a Cognito ACCESS token from your own Google sign-in; current value only, never committed or shared). Run the folder in order for a not-yet-registered Google user: lookup -> register -> lookup again -> duplicate. See Registration/README.md.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{cognitoAccessToken}}", "type": "string" }]
+  },
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('No server internals or credentials in the body', () => {",
+          "  const body = pm.response.text();",
+          "  ['jdbc:', 'SQLException', 'at org.hmb', 'password', 'eyJ'].forEach(s => pm.expect(body).to.not.include(s));",
+          "});",
+          "pm.test('Not cacheable', () => {",
+          "  const cc = pm.response.headers.get('Cache-Control');",
+          "  if (pm.response.json().code !== undefined || pm.response.json().nextStep !== undefined) pm.expect(cc).to.eql('no-store');",
+          "});"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Account lookup (Continue with Google)",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/api/v1/auth/me"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('200 with a nextStep', () => {",
+              "  pm.response.to.have.status(200);",
+              "  pm.expect(json.success).to.eql(true);",
+              "  pm.expect(['DASHBOARD', 'SIGNUP_FORM', 'ACCOUNT_PENDING']).to.include(json.nextStep);",
+              "});",
+              "if (json.nextStep === 'SIGNUP_FORM') {",
+              "  pm.test('New user: no account data, signup message', () => {",
+              "    pm.expect(json.registered).to.eql(false);",
+              "    pm.expect(json.user).to.be.undefined;",
+              "    pm.expect(json.message).to.eql('Complete your HireMeBot student registration.');",
+              "  });",
+              "} else {",
+              "  pm.test('Registered: own profile', () => {",
+              "    pm.expect(json.registered).to.eql(true);",
+              "    pm.expect(json.user.userId).to.eql(json.user.studentId);",
+              "    pm.expect(json.user.accountType).to.eql('STUDENT');",
+              "    pm.expect(json.user.phoneVerified).to.eql(false);",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Register student (after SIGNUP_FORM)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/api/v1/students/register",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"firstName\": \"Alex\",\n  \"lastName\": \"Smith\",\n  \"phoneNumber\": \"+17135550101\",\n  \"acceptedTerms\": true\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('201 registered (or 409 if already registered / name taken)', () => {",
+              "  pm.expect([201, 409]).to.include(pm.response.code);",
+              "});",
+              "if (pm.response.code === 201) {",
+              "  pm.test('V1 policy: ACTIVE, DASHBOARD, phone not verified', () => {",
+              "    pm.expect(json.code).to.eql('STUDENT_REGISTERED');",
+              "    pm.expect(json.data.userId).to.eql(json.data.studentId);",
+              "    pm.expect(json.data.emailVerified).to.eql(true);",
+              "    pm.expect(json.data.phoneVerified).to.eql(false);",
+              "    pm.expect(json.data.accountStatus).to.eql('ACTIVE');",
+              "    pm.expect(json.data.nextStep).to.eql('DASHBOARD');",
+              "  });",
+              "  pm.collectionVariables.set('registeredUserId', json.data.userId);",
+              "} else {",
+              "  pm.test('Known conflict code', () => pm.expect(['ACCOUNT_ALREADY_REGISTERED', 'NAME_ALREADY_REGISTERED', 'ACCOUNT_IDENTITY_CONFLICT']).to.include(json.code));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Account lookup again (returning student -> DASHBOARD)",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/api/v1/auth/me"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('Registered student goes to the dashboard', () => {",
+              "  pm.response.to.have.status(200);",
+              "  pm.expect(json.registered).to.eql(true);",
+              "  pm.expect(json.nextStep).to.eql('DASHBOARD');",
+              "  const id = pm.collectionVariables.get('registeredUserId');",
+              "  if (id) pm.expect(String(json.user.userId)).to.eql(String(id));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Register again (duplicate -> 409, nothing created)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/api/v1/students/register",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"firstName\":\"Alex\",\"lastName\":\"Smith\",\"phoneNumber\":\"+17135550101\",\"acceptedTerms\":true}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('409 ACCOUNT_ALREADY_REGISTERED with a requestId', () => {",
+              "  pm.response.to.have.status(409);",
+              "  pm.expect(pm.response.json().code).to.eql('ACCOUNT_ALREADY_REGISTERED');",
+              "  pm.expect(pm.response.json().requestId).to.be.a('string');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Lookup without token -> 401",
+      "request": {
+        "auth": { "type": "noauth" },
+        "method": "GET",
+        "url": "{{baseUrl}}/api/v1/auth/me"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('401 (API Gateway {message:Unauthorized} or backend UNAUTHORIZED)', () => {",
+              "  pm.response.to.have.status(401);",
+              "  const json = pm.response.json();",
+              "  pm.expect(json.code === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Lookup with a forged token -> 401",
+      "request": {
+        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "eyJraWQiOiJmYWtlIiwiYWxnIjoiUlMyNTYifQ.eyJzdWIiOiJ4IiwidG9rZW5fdXNlIjoiYWNjZXNzIn0.c2ln", "type": "string" }] },
+        "method": "GET",
+        "url": "{{baseUrl}}/api/v1/auth/me?email=someone@example.com&userId=1"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('401; query parameters cannot supply an identity', () => pm.response.to.have.status(401));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Register: validation error -> 400",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/api/v1/students/register",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"firstName\":\"\",\"lastName\":\"Smith\",\"phoneNumber\":\"7135550101\",\"acceptedTerms\":false}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400 VALIDATION_FAILED with field errors (needs a valid token; 401 otherwise)', () => {",
+              "  pm.response.to.have.status(400);",
+              "  const json = pm.response.json();",
+              "  pm.expect(json.code).to.eql('VALIDATION_FAILED');",
+              "  pm.expect(json.fieldErrors.map(e => e.field)).to.include.members(['firstName', 'phoneNumber', 'acceptedTerms']);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Register: wrong content type -> 415",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "text/plain" }],
+        "url": "{{baseUrl}}/api/v1/students/register",
+        "body": { "mode": "raw", "raw": "firstName=Alex" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('415 UNSUPPORTED_MEDIA_TYPE (needs a valid token; 401 otherwise)', () => {",
+              "  pm.response.to.have.status(415);",
+              "  pm.expect(pm.response.json().code).to.eql('UNSUPPORTED_MEDIA_TYPE');",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "registeredUserId", "value": "" }
+  ]
+}

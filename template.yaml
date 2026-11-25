@@ -15,25 +15,69 @@ Parameters:
       The single browser origin of the Recruiter Portal. It is the only origin allowed by CORS on the HTTP API and on
       direct uploads to the documents bucket. The default is the Vite dev server for local work; pass the real portal
       origin on deploy.
-  ReconcileSchedule:
+  # ---- Student registration (Cognito + Google) ---------------------------------------------------------------------
+  CognitoUserPoolId:
     Type: String
-    Default: "rate(3 hours)"
-    Description: How often the document reconciler runs (an EventBridge schedule expression).
-  AlarmTopicArn:
+    Default: us-east-2_F582IgoSY
+    AllowedPattern: '^[a-z]{2}(-[a-z]+)+-\d_[0-9A-Za-z]+$'
+    Description: Existing Cognito user pool (Google federation). Its region is taken from the id prefix.
+  CognitoAppClientId:
+    Type: String
+    Default: 5rgjoisv64qhe70oulfla17id9
+    AllowedPattern: '^[0-9A-Za-z]{1,128}$'
+    Description: App client the access tokens are issued to (checked as the JWT authorizer audience / client_id).
+  CognitoDomain:
+    Type: String
+    Default: us-east-2f582igosy.auth.us-east-2.amazoncognito.com
+    AllowedPattern: '^[a-z0-9.-]+$'
+    Description: Cognito hosted domain (no scheme); the Lambda calls https://<domain>/oauth2/userInfo.
+  TermsVersion:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9._-]{1,30}$'
+    ConstraintDescription: 1-30 letters, digits, '.', '_' or '-' (users.terms_version VARCHAR(30)).
+    Description: >
+      The Terms version a registering student accepts; stored in users.terms_version. No default on purpose: it must
+      be the version the frontend actually shows.
+  PhoneVerificationRequired:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Account policy, shared by GET /api/v1/auth/me and POST /api/v1/students/register. V1 uses "false": new students
+      are stored ACTIVE and go to the dashboard (nextStep DASHBOARD) with a verified Google email and an unverified
+      phone; the development mock OTP proves nothing. "true" stores PENDING (nextStep ACCOUNT_PENDING) until real SMS
+      verification exists. The phone is never marked verified either way.
+  DatabaseName:
+    Type: String
+    Default: hiremebot_db_v1
+    AllowedPattern: '^[a-z][a-z0-9_]{0,63}$'
+    ConstraintDescription: Lower-case letters, digits and '_' only, starting with a letter (at most 64 characters).
+    Description: >
+      Name of the MySQL database every function connects to (DB_NAME). MySQL database names are case-sensitive on Linux
+      (RDS), so the name must match the one the schema was created with, character for character; lower case is enforced
+      to keep every environment identical. Pass a different name per environment (for example hiremebot_db_v1_staging)
+      with --parameter-overrides DatabaseName=...; sam local takes DB_NAME from env.json instead.
+  RegistrationDbSecretArn:
     Type: String
     Default: ""
-    Description: Optional SNS topic that is notified when the document reconciler fails or finds a problem.
+    AllowedPattern: '^$|^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
+    Description: >
+      Secrets Manager secret with the database credentials (JSON: username, password, optional host/port/dbname).
+      Required for any deployed stack; leave empty only for sam local, where env.json supplies DB_USERNAME/DB_PASSWORD.
 
 Conditions:
-  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+  HasRegistrationDbSecret: !Not [!Equals [!Ref RegistrationDbSecretArn, ""]]
 
 Globals:
   Function:
     Timeout: 20
     MemorySize: 512
   HttpApi:
-    # Needed because the portal calls the API from the browser. One explicit origin, never a wildcard. The X-Dev-*
-    # headers exist only for local development; with production authentication they are replaced by Authorization.
+    # Needed because the portals call the API from the browser. One explicit origin, never a wildcard (pass the real
+    # portal origin as PortalOrigin on deploy). The recruiter and registration routes authenticate with the Cognito
+    # access token in Authorization, as does the student dashboard. The development headers (X-Dev-Recruiter-Id and
+    # X-Dev-Student-Id) are NOT allowed cross-origin: a browser never needs them, and the Lambdas honour them only under
+    # `sam local` (curl/Postman are not subject to CORS).
     CorsConfiguration:
       AllowOrigins:
         - !Ref PortalOrigin
@@ -44,11 +88,33 @@ Globals:
       AllowHeaders:
         - Content-Type
         - Authorization
-        - X-Dev-Recruiter-Id
-        - X-Dev-Student-Id
       MaxAge: 600
+    # Cognito JWT authorizer. Declared here but NOT a DefaultAuthorizer: only routes that name it use it (the four
+    # registration/sign-in routes, the recruiter and document routes, and the student dashboard route).
+    # It verifies signature, issuer, expiry and that aud/client_id is the app client; it does not distinguish access from
+    # ID tokens, so each Lambda additionally verifies the token itself (including token_use=access), which also protects
+    # `sam local`, where authorizers do not run.
+    Auth:
+      Authorizers:
+        CognitoAccessToken:
+          IdentitySource: $request.header.Authorization
+          JwtConfiguration:
+            issuer: !Sub
+              - "https://cognito-idp.${PoolRegion}.amazonaws.com/${CognitoUserPoolId}"
+              - PoolRegion: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
+            audience:
+              - !Ref CognitoAppClientId
+    # One JSON line per request; never includes headers, so no tokens are logged.
+    AccessLogSettings:
+      DestinationArn: !GetAtt HttpApiAccessLogs.Arn
+      Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","latencyMs":"$context.responseLatency","authorizerError":"$context.authorizer.error","integrationError":"$context.integrationErrorMessage"}'
 
 Resources:
+  HttpApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
   RecruiterFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -65,15 +131,22 @@ Resources:
         Variables:
           DB_HOST: ""
           DB_PORT: "3306"
-          DB_NAME: ""
+          DB_NAME: !Ref DatabaseName
           DB_USERNAME: ""
           DB_PASSWORD: ""
           DB_SSL_MODE: VERIFY_IDENTITY
           DB_TRUSTSTORE_URL: ""
           DB_TRUSTSTORE_PASSWORD: ""
           DB_TRUSTSTORE_TYPE: PKCS12
-          # X-Dev-Recruiter-Id is NOT authentication. Keep "false" for any deployed stack; only the
-          # local env.json turns it on. Replace with Cognito/JWT before exposing this API.
+          # The recruiter is identified by the Cognito access token (verified in the Lambda, then mapped to an approved
+          # recruiter in MySQL); these three settings say which pool and app client the token must come from.
+          COGNITO_REGION: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_ID: !Ref CognitoAppClientId
+          # X-Dev-Recruiter-Id is a local-development fallback, NOT authentication. Keep "false" for any deployed stack
+          # and set "true" only in the git-ignored local env.json. Even then the Lambda honours the header only under
+          # `sam local` (AWS_SAM_LOCAL) and only when the request carries no Authorization header, so a deployed stack
+          # ignores it whatever this says, and a Bearer token always wins.
           ALLOW_DEV_RECRUITER_HEADER: "false"
       Events:
         CreateApplication:
@@ -81,11 +154,19 @@ Resources:
           Properties:
             Path: /api/v1/recruiter/applications
             Method: post
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
         ListAssignedStudents:
           Type: HttpApi
           Properties:
             Path: /api/v1/recruiter/students
             Method: get
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
 
   StudentFunction:
     Type: AWS::Serverless::Function
@@ -101,7 +182,7 @@ Resources:
         Variables:
           DB_HOST: ""
           DB_PORT: "3306"
-          DB_NAME: ""
+          DB_NAME: !Ref DatabaseName
           DB_USERNAME: ""
           DB_PASSWORD: ""
           DB_SSL_MODE: VERIFY_IDENTITY
@@ -112,8 +193,15 @@ Resources:
           APP_TIMEZONE: America/Chicago
           # Per-weekday application target; the monthly target is this times the weekdays in the month.
           DAILY_APPLICATION_TARGET: "50"
-          # X-Dev-Student-Id is NOT authentication. Keep "false" for any deployed stack; only the
-          # local env.json turns it on. Replace with Cognito/JWT before exposing this API.
+          # The student is identified by the Cognito access token (verified in the Lambda, then mapped to an ACTIVE
+          # student in MySQL); these three settings say which pool and app client the token must come from.
+          COGNITO_REGION: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_ID: !Ref CognitoAppClientId
+          # X-Dev-Student-Id is a local-development fallback, NOT authentication. Keep "false" for any deployed stack
+          # and set "true" only in the git-ignored local env.json. Even then the Lambda honours the header only under
+          # `sam local` (AWS_SAM_LOCAL) and only when the request carries no Authorization header, so a deployed stack
+          # ignores it whatever this says, and a Bearer token always wins.
           ALLOW_DEV_STUDENT_HEADER: "false"
       Events:
         ListApplications:
@@ -121,9 +209,16 @@ Resources:
           Properties:
             Path: /api/v1/student/applications
             Method: get
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
 
   # ---- Document upload (resumes) -------------------------------------------------------------------------------
   # Browser -> presigned PUT -> this private bucket. Nothing here is public; the bucket never serves a GET.
+  # V1 has no automatic cleanup: no lifecycle rules, no versioning, and no function may delete objects. Uploads keep
+  # their doc-state tag (pending -> registered) so a future, manually invoked cleanup tool can find abandoned ones
+  # (see docs/DOCUMENT_CLEANUP_DESIGN.md).
   DocumentsBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -132,8 +227,7 @@ Resources:
       # No fixed BucketName: CloudFormation generates a unique one.
       BucketEncryption:
         ServerSideEncryptionConfiguration:
-          - BucketKeyEnabled: true
-            ServerSideEncryptionByDefault:
+          - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -143,27 +237,10 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
-      # Safety net: if a registered object were ever expired by mistake, the file stays recoverable for 30 days.
-      VersioningConfiguration:
-        Status: Enabled
-      LifecycleConfiguration:
-        Rules:
-          # Uploads are tagged doc-state=pending by the presigned URL and retagged registered once they are in MySQL.
-          # Only pending objects ever expire, so abandoned and lost-race uploads clean themselves up. The reconciler
-          # retags any registered object still pending long before this fires. Nothing in the system deletes objects.
-          - Id: ExpireUnregisteredUploads
-            Status: Enabled
-            TagFilters:
-              - Key: doc-state
-                Value: pending
-            ExpirationInDays: 7
-            NoncurrentVersionExpiration:
-              NoncurrentDays: 30
-          - Id: AbortIncompleteMultipartUploads
-            Status: Enabled
-            Prefix: students/
-            AbortIncompleteMultipartUpload:
-              DaysAfterInitiation: 1
+      # No VersioningConfiguration: this bucket has never been deployed, so versioning was never enabled and simply
+      # stays off. (Removing the property would NOT turn versioning off on a bucket where it had been enabled; that
+      # needs an explicit "Status: Suspended".)
+      # No LifecycleConfiguration: S3 never expires or deletes anything in V1, pending uploads included.
       # Direct uploads from the browser: PUT from the one portal origin, with exactly the signed headers.
       CorsConfiguration:
         CorsRules:
@@ -221,17 +298,22 @@ Resources:
         Variables:
           DB_HOST: ""
           DB_PORT: "3306"
-          DB_NAME: ""
+          DB_NAME: !Ref DatabaseName
           DB_USERNAME: ""
           DB_PASSWORD: ""
           DB_SSL_MODE: VERIFY_IDENTITY
           DB_TRUSTSTORE_URL: ""
           DB_TRUSTSTORE_PASSWORD: ""
           DB_TRUSTSTORE_TYPE: PKCS12
-          # X-Dev-Recruiter-Id is NOT authentication. Keep "false" for any deployed stack. The code additionally
-          # refuses the header unless the process runs under `sam local`, so a deployed stack answers 403 to every
-          # call until production authentication exists. Production authentication (Cognito/JWT mapped to a
-          # recruiter) is a prerequisite before these APIs are exposed.
+          # The recruiter is identified by the Cognito access token (verified in the Lambda, then mapped to an approved
+          # recruiter in MySQL); these three settings say which pool and app client the token must come from.
+          COGNITO_REGION: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_ID: !Ref CognitoAppClientId
+          # X-Dev-Recruiter-Id is a local-development fallback, NOT authentication. Keep "false" for any deployed stack
+          # and set "true" only in the git-ignored local env.json. Even then the Lambda honours the header only under
+          # `sam local` (AWS_SAM_LOCAL) and only when the request carries no Authorization header, so a deployed stack
+          # ignores it whatever this says, and a Bearer token always wins.
           ALLOW_DEV_RECRUITER_HEADER: "false"
           DOCUMENTS_BUCKET: !Ref DocumentsBucket
           UPLOAD_SIGNING_SECRET_ID: !Ref UploadSigningSecret
@@ -270,88 +352,154 @@ Resources:
               Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref UploadSigningSecret
-            # Deliberately absent: s3:DeleteObject. Only the lifecycle rule ever removes an object.
+            # Deliberately absent: s3:DeleteObject. Nothing in V1 deletes objects (no lifecycle rule either).
       Events:
         RequestUploadUrl:
           Type: HttpApi
           Properties:
             Path: /api/v1/documents/upload-url
             Method: post
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
         RegisterDocument:
           Type: HttpApi
           Properties:
             Path: /api/v1/documents/register
             Method: post
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
 
-  # Scheduled job, not an API. Heals objects whose MySQL row exists but whose tag is still `pending` (the tagging
-  # step failed after the insert). It never deletes anything and never writes to MySQL.
-  DocumentReconciliationFunction:
+  # ---- Student and recruiter sign-in and registration -----------------------------------------------------------
+  # The "Registration" Lambda (Maven module Registration/) serves the unified "Continue with Google" flow of both
+  # portals, all four routes behind the Cognito JWT authorizer (the function also verifies the token itself on every
+  # request):
+  #   GET  /api/v1/auth/me                  student lookup -> DASHBOARD | SIGNUP_FORM | ACCOUNT_PENDING | 403/409
+  #   POST /api/v1/students/register        Cognito UserInfo + AdminGetUser, then users + students + user_identities in
+  #                                         one MySQL transaction
+  #   GET  /api/v1/recruiters/auth/me       recruiter lookup -> RECRUITER_DASHBOARD | RECRUITER_SIGNUP_FORM |
+  #                                         APPROVAL_PENDING | 403/409
+  #   POST /api/v1/recruiters/register      same, with the recruiters row; always PENDING until the operator approves it
+  #                                         with the manual UPDATE in Registration/db/recruiter-approval.sql
+  # Network: outside a VPC it reaches Cognito and Secrets Manager directly. If MySQL is private and the function is
+  # placed in a VPC (VpcConfig), it needs a NAT gateway route for the Cognito hosted domain (/oauth2/userInfo) and the
+  # JWKS URL, plus NAT or interface endpoints for cognito-idp and secretsmanager. See Registration/README.md.
+  RegistrationFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: DocumentManagementLambda
-      Handler: org.hmb.handler.DocumentReconciliationHandler::handleRequest
+      CodeUri: Registration
+      Handler: org.hmb.handler.RegistrationHandler::handleRequest
       Runtime: java21
       Architectures:
         - x86_64
-      MemorySize: 512
-      Timeout: 300
+      # The AWS SDK and JWT libraries make the Java cold start CPU-bound; 1024 MB roughly halves it.
+      MemorySize: 1024
+      # Worst case: Cognito calls (5 s + 8 s budgets) + DB connect (5 s) stays under 20 s.
+      Timeout: 20
       Environment:
+        # DB_USERNAME/DB_PASSWORD are placeholders for sam local only (env.json); deployed stacks use DB_SECRET_ARN.
         Variables:
           DB_HOST: ""
           DB_PORT: "3306"
-          DB_NAME: ""
+          DB_NAME: !Ref DatabaseName
           DB_USERNAME: ""
           DB_PASSWORD: ""
           DB_SSL_MODE: VERIFY_IDENTITY
           DB_TRUSTSTORE_URL: ""
           DB_TRUSTSTORE_PASSWORD: ""
           DB_TRUSTSTORE_TYPE: PKCS12
-          DOCUMENTS_BUCKET: !Ref DocumentsBucket
-          # Must stay below the 7-day expiry of pending objects (the code enforces at most 6).
-          RECONCILE_LOOKBACK_DAYS: "5"
-          RECONCILE_BATCH_SIZE: "500"
+          DB_SECRET_ARN: !Ref RegistrationDbSecretArn
+          COGNITO_REGION: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_ID: !Ref CognitoAppClientId
+          COGNITO_DOMAIN: !Ref CognitoDomain
+          TERMS_VERSION: !Ref TermsVersion
+          PHONE_VERIFICATION_REQUIRED: !Ref PhoneVerificationRequired
       Policies:
         - Version: '2012-10-17'
           Statement:
-            - Sid: ReadAndSetRegisteredTag
+            # Read-only lookup proving the caller is a Google-federated user. Nothing else in Cognito is allowed
+            # (in particular no AdminLinkProviderForUser, AdminDeleteUser or attribute updates).
+            - Sid: VerifyGoogleFederatedUser
               Effect: Allow
-              Action:
-                - s3:GetObjectTagging
-                - s3:PutObjectTagging
-              Resource: !Sub "${DocumentsBucket.Arn}/students/*"
-            - Sid: DistinguishMissingFromForbidden
-              Effect: Allow
-              Action: s3:ListBucket
-              Resource: !GetAtt DocumentsBucket.Arn
+              Action: cognito-idp:AdminGetUser
+              Resource: !Sub
+                - "arn:${AWS::Partition}:cognito-idp:${PoolRegion}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
+                - PoolRegion: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
+            - !If
+              - HasRegistrationDbSecret
+              - Sid: ReadDatabaseCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref RegistrationDbSecretArn
+              - !Ref AWS::NoValue
       Events:
-        Schedule:
-          Type: Schedule
+        AccountLookup:
+          Type: HttpApi
           Properties:
-            Schedule: !Ref ReconcileSchedule
-            Enabled: true
+            Path: /api/v1/auth/me
+            Method: get
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
+        RegisterStudent:
+          Type: HttpApi
+          Properties:
+            Path: /api/v1/students/register
+            Method: post
+            Auth:
+              Authorizer: CognitoAccessToken
+              # Access tokens carry "scope"; ID tokens do not, so API Gateway already refuses an ID token here (403).
+              AuthorizationScopes:
+                - openid
+        RecruiterAccountLookup:
+          Type: HttpApi
+          Properties:
+            Path: /api/v1/recruiters/auth/me
+            Method: get
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
+        RegisterRecruiter:
+          Type: HttpApi
+          Properties:
+            Path: /api/v1/recruiters/register
+            Method: post
+            Auth:
+              Authorizer: CognitoAccessToken
+              AuthorizationScopes:
+                - openid
 
-  # The reconciler fails its invocation when it finds a missing file, cannot check a row, or cannot finish.
-  DocumentReconciliationErrorsAlarm:
-    Type: AWS::CloudWatch::Alarm
+  RegistrationFunctionLogs:
+    Type: AWS::Logs::LogGroup
     Properties:
-      AlarmDescription: The document reconciler failed or found a registered document without its file.
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref DocumentReconciliationFunction
-      Statistic: Sum
-      Period: 21600
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: !If
-        - HasAlarmTopic
-        - - !Ref AlarmTopicArn
-        - !Ref AWS::NoValue
+      LogGroupName: !Sub "/aws/lambda/${RegistrationFunction}"
+      RetentionInDays: 30
 
 Outputs:
+  AccountLookupUrl:
+    Description: "HTTP API URL for GET /api/v1/auth/me (Cognito access token required)"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/auth/me"
+  StudentRegistrationUrl:
+    Description: "HTTP API URL for POST /api/v1/students/register (Cognito access token required)"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/students/register"
+  RecruiterAccountLookupUrl:
+    Description: "HTTP API URL for GET /api/v1/recruiters/auth/me (Cognito access token required)"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/recruiters/auth/me"
+  RecruiterRegistrationUrl:
+    Description: "HTTP API URL for POST /api/v1/recruiters/register (Cognito access token required)"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/recruiters/register"
+  RegistrationFunction:
+    Description: "Registration Lambda Function ARN"
+    Value: !GetAtt RegistrationFunction.Arn
+  RegistrationFunctionIamRole:
+    Description: "Implicit IAM Role created for the Registration function"
+    Value: !GetAtt RegistrationFunctionRole.Arn
   RecruiterApplicationsUrl:
     Description: "HTTP API URL for POST /api/v1/recruiter/applications"
     Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/recruiter/applications"
@@ -385,6 +533,3 @@ Outputs:
   DocumentManagementFunction:
     Description: "Document upload Lambda Function ARN"
     Value: !GetAtt DocumentManagementFunction.Arn
-  DocumentReconciliationFunction:
-    Description: "Document reconciler Lambda Function ARN"
-    Value: !GetAtt DocumentReconciliationFunction.Arn

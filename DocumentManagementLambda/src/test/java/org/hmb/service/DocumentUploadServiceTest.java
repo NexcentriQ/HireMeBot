@@ -427,7 +427,7 @@ class DocumentUploadServiceTest {
 
         RegisterOutcome outcome = service.registerDocument(registerRequest(), Fixtures.RECRUITER_ID);
 
-        // The row exists, so the client is told it worked; replay or the reconciler completes the tag.
+        // The row exists, so the client is told it worked; a replay of register completes the tag.
         assertTrue(outcome.created());
         assertEquals(NEW_OBJECT_ID, outcome.body().objectId());
         verify(documents).insert(connection, Fixtures.STUDENT_ID, DocumentType.RESUME, KEY, Fixtures.SHA256_HEX);

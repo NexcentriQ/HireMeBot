@@ -16,6 +16,7 @@ import org.hmb.exception.ErrorResponse;
 import org.hmb.repository.StudentApplicationRepository;
 import org.hmb.repository.StudentRepository;
 import org.hmb.repository.StudentStatisticsRepository;
+import org.hmb.security.StudentAuthenticator;
 import org.hmb.service.StudentApplicationService;
 import org.hmb.service.StudentStatisticsService;
 import org.slf4j.Logger;
@@ -35,15 +36,17 @@ import java.util.function.Supplier;
  * <p>The endpoint always reports the current date (resolved in the reporting zone) and takes no query parameters.
  * The deprecated {@code date} parameter, and other period/pagination parameters, are rejected with 400.
  *
- * <p><b>The {@code X-Dev-Student-Id} header is NOT authentication.</b> It exists only for local development
- * and is honoured only when the environment variable {@code ALLOW_DEV_STUDENT_HEADER} is {@code true}.
- * It must be replaced by Cognito/JWT claims before this API is exposed publicly.
+ * <p><b>Authentication.</b> The student is identified only by the verified Cognito <em>access token</em>
+ * ({@code Authorization: Bearer <token>}), resolved to an ACTIVE, non-deleted student by {@link StudentAuthenticator}.
+ * Nothing the client sends (a student id in a header or query) selects the student, so a student can only ever read
+ * their own applications. The {@code X-Dev-Student-Id} header is NOT authentication: it is honoured only when the
+ * request carries no {@code Authorization} header at all <em>and</em> {@code ALLOW_DEV_STUDENT_HEADER=true} under
+ * {@code sam local} ({@link org.hmb.security.DevAuth}). A token, valid or not, always wins, and a deployed stack
+ * ignores the header.
  */
 public class StudentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse> {
 
     static final String ROUTE_PATH = "/api/v1/student/applications";
-    static final String DEV_STUDENT_HEADER = "X-Dev-Student-Id";
-    static final String DEV_HEADER_ENABLE_VAR = "ALLOW_DEV_STUDENT_HEADER";
 
     /**
      * Query parameters the frontend must no longer send: the backend chooses all reporting periods and returns
@@ -57,24 +60,51 @@ public class StudentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEven
     private static final ObjectMapper MAPPER = JsonMapper.builder().build();
 
     private static volatile StudentApplicationService defaultService;
+    private static volatile StudentAuthenticator defaultAuthenticator;
 
     private final Supplier<StudentApplicationService> serviceSupplier;
-    private final boolean devHeaderEnabled;
+    private final Supplier<StudentAuthenticator> authenticatorSupplier;
 
     /** Used by the Lambda runtime. Resources are created lazily and reused while the environment is warm. */
     public StudentLambdaHandler() {
-        this(StudentLambdaHandler::defaultService,
-                "true".equalsIgnoreCase(System.getenv(DEV_HEADER_ENABLE_VAR)));
+        this(StudentLambdaHandler::defaultService, StudentLambdaHandler::defaultAuthenticator);
     }
 
-    /** For tests. */
-    public StudentLambdaHandler(StudentApplicationService service, boolean devHeaderEnabled) {
-        this(() -> service, devHeaderEnabled);
+    /**
+     * For tests of the <em>local header-only</em> path: no token verification and no database for authentication.
+     *
+     * @param devHeaderPermitted whether {@code X-Dev-Student-Id} may identify a caller (a request that carries an
+     *                           {@code Authorization} header is refused with 401 in this mode)
+     */
+    public StudentLambdaHandler(StudentApplicationService service, boolean devHeaderPermitted) {
+        this(service, StudentAuthenticator.devHeaderOnly(devHeaderPermitted));
     }
 
-    private StudentLambdaHandler(Supplier<StudentApplicationService> serviceSupplier, boolean devHeaderEnabled) {
+    /** For tests: a fully wired authenticator (token verification, account lookup, dev-header gate). */
+    public StudentLambdaHandler(StudentApplicationService service, StudentAuthenticator authenticator) {
+        this(() -> service, () -> authenticator);
+    }
+
+    private StudentLambdaHandler(Supplier<StudentApplicationService> serviceSupplier,
+                                 Supplier<StudentAuthenticator> authenticatorSupplier) {
         this.serviceSupplier = serviceSupplier;
-        this.devHeaderEnabled = devHeaderEnabled;
+        this.authenticatorSupplier = authenticatorSupplier;
+    }
+
+    /** Built from the environment ({@code COGNITO_*}, the dev-header gate) on first use; a bad setting fails closed. */
+    private static StudentAuthenticator defaultAuthenticator() {
+        StudentAuthenticator local = defaultAuthenticator;
+        if (local == null) {
+            synchronized (StudentLambdaHandler.class) {
+                local = defaultAuthenticator;
+                if (local == null) {
+                    local = StudentAuthenticator.fromEnvironment(System.getenv(), DatabaseConfig.getDataSource(),
+                            Clock.systemUTC());
+                    defaultAuthenticator = local;
+                }
+            }
+        }
+        return local;
     }
 
     private static StudentApplicationService defaultService() {
@@ -101,7 +131,9 @@ public class StudentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEven
     public APIGatewayV2HTTPResponse handleRequest(APIGatewayV2HTTPEvent event, Context context) {
         try {
             checkRoute(event);
-            long studentId = readStudentId(event);
+            // The only source of the acting student: the verified token (or, local only, the header when no token).
+            long studentId = authenticatorSupplier.get()
+                    .authenticate(event.getHeaders(), authorizerClaims(event)).studentId();
             rejectDeprecatedParams(event);
 
             StudentApplicationsResponse result = serviceSupplier.get().getApplications(studentId);
@@ -135,28 +167,14 @@ public class StudentLambdaHandler implements RequestHandler<APIGatewayV2HTTPEven
         }
     }
 
-    private long readStudentId(APIGatewayV2HTTPEvent event) {
-        if (!devHeaderEnabled) {
-            // Fail closed: without real authentication in place, a plain header must never identify a student.
-            throw ApiException.forbidden("Student authentication is not configured");
+    /** The claims of API Gateway's JWT authorizer when it ran (deployed); empty under {@code sam local}. */
+    private static Map<String, String> authorizerClaims(APIGatewayV2HTTPEvent event) {
+        var context = event.getRequestContext();
+        if (context == null || context.getAuthorizer() == null || context.getAuthorizer().getJwt() == null
+                || context.getAuthorizer().getJwt().getClaims() == null) {
+            return Map.of();
         }
-        Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        if (event.getHeaders() != null) {
-            headers.putAll(event.getHeaders());
-        }
-        String raw = headers.get(DEV_STUDENT_HEADER);
-        if (raw == null || raw.isBlank()) {
-            throw ApiException.badRequest("Missing required header " + DEV_STUDENT_HEADER);
-        }
-        try {
-            long id = Long.parseLong(raw.trim());
-            if (id <= 0) {
-                throw new NumberFormatException("not positive");
-            }
-            return id;
-        } catch (NumberFormatException e) {
-            throw ApiException.badRequest(DEV_STUDENT_HEADER + " must be a positive number");
-        }
+        return context.getAuthorizer().getJwt().getClaims();
     }
 
     /**

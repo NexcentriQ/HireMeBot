@@ -211,16 +211,18 @@ class DocumentLambdaHandlerTest {
 
     // ---- authentication: local development only -----------------------------------------------------------------
 
+    /** The header is not a credential unless explicitly permitted (local only): no token and no header = 401. */
     @Test
-    void whenDevAuthIsNotPermittedEveryCallIsForbiddenEvenWithAValidHeader() throws Exception {
+    void whenDevAuthIsNotPermittedTheHeaderIsIgnoredAndEveryCallIs401() throws Exception {
         handler = new DocumentLambdaHandler(service, false);
 
         APIGatewayV2HTTPResponse upload = post(UPLOAD_URL_PATH, recruiterHeader("1000000001"), UPLOAD_BODY);
         APIGatewayV2HTTPResponse register = post(REGISTER_PATH, recruiterHeader("1000000001"), REGISTER_BODY);
 
-        assertEquals(403, upload.getStatusCode());
-        assertEquals(403, register.getStatusCode());
-        assertEquals("Recruiter authentication is not configured", body(upload).get("message").asText());
+        assertEquals(401, upload.getStatusCode());
+        assertEquals(401, register.getStatusCode());
+        assertEquals("UNAUTHORIZED", body(upload).get("error").asText());
+        assertEquals("Authentication is required.", body(upload).get("message").asText());
         verifyNoInteractions(service);
     }
 

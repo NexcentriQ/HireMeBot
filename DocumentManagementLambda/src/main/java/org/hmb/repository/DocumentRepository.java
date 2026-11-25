@@ -36,7 +36,7 @@ public class DocumentRepository {
             VALUES (?, ?, ?, ?)
             """;
 
-    /** Keyset-paged scan of recent rows for the reconciler (read-only). */
+    /** Keyset-paged scan of recent rows (read-only). Not used by the upload API itself. */
     private static final String RECENT_AFTER_SQL = "SELECT " + COLUMNS
             + " FROM object_store_entries WHERE created_at >= ? AND object_id > ? ORDER BY object_id LIMIT ?";
 

@@ -5,6 +5,8 @@
 !.env.example
 env.json
 !env.json.example
+# Per-target `sam local` environment files, e.g. env.railway.json (credentials)
+env.*.json
 # Truststores, certificates and keys (e.g. a database provider's CA bundle)
 *.p12
 *.pfx

@@ -45,8 +45,10 @@ import java.util.regex.Pattern;
  * <p><b>Consistency between S3 and MySQL.</b> MySQL is the source of truth; the S3 {@code doc-state} tag is only a
  * derived marker. Registration is {@code verify -> INSERT -> tag registered}. If anything fails after the insert, the
  * request still succeeds (the row is authoritative) and the tag is completed by a client retry (the replay path
- * below) or by the scheduled reconciler. If it fails before the insert, nothing is recorded and the unregistered
- * object simply expires. No code here deletes an S3 object or updates or deletes a row.
+ * below). A row whose object stays {@code pending} is harmless: V1 has no lifecycle rule, so nothing expires it, and a
+ * future cleanup tool must check MySQL before treating any {@code pending} object as abandoned. If registration fails
+ * before the insert, nothing is recorded and the unregistered object stays {@code pending} in S3 (V1 never deletes
+ * it). No code here deletes an S3 object or updates or deletes a row.
  *
  * <p>Authorization on both calls: the caller is an active recruiter, assigned to the student. The recruiter id is the
  * authenticated identity passed in by the handler, never a field of the request.
@@ -206,7 +208,7 @@ public class DocumentUploadService {
             LOG.error("Registered document {} has no S3 object", known.objectId());
             throw unavailable();
         } catch (ApiException e) {
-            // S3 itself is unavailable: the row is authoritative, the reconciler will finish the tag.
+            // S3 itself is unavailable: the row is authoritative; a later retry of register finishes the tag.
             LOG.warn("Could not confirm the registered tag for document {}", known.objectId());
         }
         return new RegisterOutcome(RegisterResponse.success(known.objectId(), valid.studentId(), valid.type()), false);
@@ -261,8 +263,9 @@ public class DocumentUploadService {
                 return null;
             });
         } catch (RuntimeException e) {
-            // Do not fail the request: the row exists. A retry or the reconciler completes the tag.
-            LOG.warn("Registered document {} but could not set its registered tag; it will be reconciled", objectId);
+            // Do not fail the request: the row exists. A retry of register completes the tag.
+            LOG.warn("Registered document {} but could not set its registered tag; it stays pending until a retry",
+                    objectId);
         }
     }
 

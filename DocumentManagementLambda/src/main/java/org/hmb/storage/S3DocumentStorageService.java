@@ -28,10 +28,11 @@ import java.util.Optional;
 /**
  * Everything the module does with S3, behind one thin class so the services can be tested with a mock.
  *
- * <p><b>Object state tag.</b> Every upload is signed with {@code x-amz-tagging: doc-state=pending}; a bucket lifecycle
- * rule expires only {@code pending} objects, after 7 days. After a document is registered in MySQL the object is
- * retagged {@code registered}, which the rule ignores. MySQL is the source of truth: the tag is only a derived
- * marker, and no code here ever deletes an object.
+ * <p><b>Object state tag.</b> Every upload is signed with {@code x-amz-tagging: doc-state=pending}. After a document
+ * is registered in MySQL the object is retagged {@code registered}. Nothing acts on the tag automatically (V1 has no
+ * lifecycle rule); it lets a future, manually invoked cleanup tool find abandoned uploads. MySQL is the source of
+ * truth: the tag is only a derived marker ({@code pending} with a row is still a registered document), and no code
+ * here ever deletes an object.
  *
  * <p>The presigned PUT signs the content type, the content length, the SHA-256 and the state tag, so S3 itself
  * rejects an upload that differs from what the backend authorized. Credentials come from the Lambda execution role.
@@ -42,7 +43,7 @@ public class S3DocumentStorageService {
     public static final String PENDING = "pending";
     public static final String REGISTERED = "registered";
 
-    /** What the reconciler needs to know about an object's tag. */
+    /** An object's {@code doc-state} tag as read by {@link #state}. Not used by the upload API itself. */
     public enum ObjectState { PENDING, REGISTERED, UNTAGGED, MISSING }
 
     /** A presigned PUT: the URL and the headers the browser must send exactly (Content-Length is set by the browser). */
@@ -143,7 +144,7 @@ public class S3DocumentStorageService {
     }
 
     /**
-     * Sets {@code doc-state=registered}, replacing the tag set. Idempotent, so retries and the reconciler can overlap.
+     * Sets {@code doc-state=registered}, replacing the tag set. Idempotent, so retries can overlap safely.
      *
      * @throws ObjectMissingException if the object does not exist
      */

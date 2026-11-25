@@ -93,11 +93,12 @@ class RecruiterLambdaHandlerTest {
         verifyNoInteractions(service);
     }
 
+    /** The header is not a credential unless explicitly permitted (local only): no token and no header = 401. */
     @Test
-    void devHeaderIsRejectedWhenNotEnabled() {
+    void devHeaderIsIgnoredWhenNotPermittedSoTheRequestHasNoCredential() {
         handler = new RecruiterLambdaHandler(service, studentService, false);
 
-        assertEquals(403, post(recruiterHeader("1000000001"), TestData.VALID_JSON).getStatusCode());
+        assertEquals(401, post(recruiterHeader("1000000001"), TestData.VALID_JSON).getStatusCode());
         verifyNoInteractions(service);
     }
 
@@ -213,10 +214,10 @@ class RecruiterLambdaHandlerTest {
     }
 
     @Test
-    void getStudentsFailsClosedWhenTheDevHeaderIsNotEnabled() {
+    void getStudentsFailsClosedWhenTheDevHeaderIsNotPermitted() {
         handler = new RecruiterLambdaHandler(service, studentService, false);
 
-        assertEquals(403, getStudents(recruiterHeader("1000000001")).getStatusCode());
+        assertEquals(401, getStudents(recruiterHeader("1000000001")).getStatusCode());
         verifyNoInteractions(studentService);
     }
 

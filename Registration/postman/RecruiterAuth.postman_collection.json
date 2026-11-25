@@ -1,0 +1,372 @@
+{
+  "info": {
+    "name": "HireMeBot - Recruiter sign-in (Continue with Google) and registration",
+    "description": "GET /api/v1/recruiters/auth/me and POST /api/v1/recruiters/register.\n\nEnvironment variables: BASE_URL (http://127.0.0.1:3000 for sam local) and the SECRET variable COGNITO_ACCESS_TOKEN (a Cognito ACCESS token from a Google account that is NOT already a student; current value only, never committed or shared). Optional secrets for the negative requests: COGNITO_ACCESS_TOKEN_STUDENT (a token of a Google account registered as a student) and COGNITO_ACCESS_TOKEN_UNVERIFIED (a token whose Google email is not verified); those requests are skipped when the variable is empty.\n\nRun in order. MANUAL STEPS between the requests (in MySQL Workbench, never through the API):\n  After '3. Pending recruiter lookup': approve the recruiter with Registration/db/recruiter-approval.sql (SET @recruiter_id = <data.userId from request 2>; run the UPDATE; ROW_COUNT() must be 1). Then run '4. Approved recruiter lookup'.\n  After '4.': UPDATE users SET account_status = 'SUSPENDED' WHERE user_id = <id>; then run '5. Suspended recruiter lookup'. Afterwards set it back to 'ACTIVE' (or delete the test rows from a non-production database).\n\nSee Registration/README.md and docs/RECRUITER_AUTH_API.md.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{COGNITO_ACCESS_TOKEN}}", "type": "string" }]
+  },
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('No server internals or credentials in the body', () => {",
+          "  const body = pm.response.text();",
+          "  ['jdbc:', 'SQLException', 'at org.hmb', 'password', 'eyJ'].forEach(s => pm.expect(body).to.not.include(s));",
+          "});"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. New recruiter lookup",
+      "request": {
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me",
+        "description": "Continue with Google for a recruiter. A Google user with no HireMeBot account gets RECRUITER_SIGNUP_FORM and nothing is created."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('200 with a recruiter nextStep', () => {",
+              "  pm.response.to.have.status(200);",
+              "  pm.expect(json.success).to.eql(true);",
+              "  pm.expect(['RECRUITER_SIGNUP_FORM', 'APPROVAL_PENDING', 'RECRUITER_DASHBOARD']).to.include(json.nextStep);",
+              "});",
+              "if (json.nextStep === 'RECRUITER_SIGNUP_FORM') {",
+              "  pm.test('New user: no account data, signup message', () => {",
+              "    pm.expect(json.registered).to.eql(false);",
+              "    pm.expect(json.user).to.be.undefined;",
+              "    pm.expect(json.message).to.eql('Complete your HireMeBot recruiter registration.');",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Recruiter registration",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{BASE_URL}}/api/v1/recruiters/register",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"firstName\": \"Alex\",\n  \"lastName\": \"Smith\",\n  \"phoneNumber\": \"+17135550101\",\n  \"acceptedTerms\": true\n}"
+        },
+        "description": "After RECRUITER_SIGNUP_FORM. The account is created PENDING; the response never contains a dashboard step."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('201 submitted (or 409 if already registered / name taken)', () => {",
+              "  pm.expect([201, 409]).to.include(pm.response.code);",
+              "});",
+              "if (pm.response.code === 201) {",
+              "  pm.test('Always PENDING and APPROVAL_PENDING, phone not verified', () => {",
+              "    pm.expect(json.success).to.eql(true);",
+              "    pm.expect(json.code).to.eql('RECRUITER_REGISTRATION_SUBMITTED');",
+              "    pm.expect(json.message).to.eql('Your recruiter registration is pending approval.');",
+              "    pm.expect(json.data.userId).to.eql(json.data.recruiterId);",
+              "    pm.expect(json.data.emailVerified).to.eql(true);",
+              "    pm.expect(json.data.phoneVerified).to.eql(false);",
+              "    pm.expect(json.data.accountStatus).to.eql('PENDING');",
+              "    pm.expect(json.data.accountType).to.eql('RECRUITER');",
+              "    pm.expect(json.data.nextStep).to.eql('APPROVAL_PENDING');",
+              "  });",
+              "  pm.collectionVariables.set('registeredRecruiterId', json.data.userId);",
+              "} else {",
+              "  pm.test('Known conflict code', () => pm.expect(['ACCOUNT_ALREADY_REGISTERED', 'NAME_ALREADY_REGISTERED', 'ACCOUNT_IDENTITY_CONFLICT']).to.include(json.code));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Pending recruiter lookup",
+      "request": {
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me",
+        "description": "The recruiter returns before approval: APPROVAL_PENDING, never the dashboard. Then do the MANUAL approval in MySQL (see the collection description)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('Pending recruiter: APPROVAL_PENDING with identifiers only', () => {",
+              "  pm.response.to.have.status(200);",
+              "  pm.expect(json.registered).to.eql(true);",
+              "  pm.expect(json.nextStep).to.eql('APPROVAL_PENDING');",
+              "  pm.expect(json.message).to.eql('Your recruiter account is waiting for approval.');",
+              "  pm.expect(Object.keys(json.user).sort()).to.eql(['accountStatus', 'accountType', 'recruiterId', 'userId']);",
+              "  pm.expect(json.user.accountStatus).to.eql('PENDING');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Approved recruiter lookup (after the manual MySQL approval)",
+      "request": {
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me",
+        "description": "Run ONLY after approving this recruiter in MySQL with Registration/db/recruiter-approval.sql. No Cognito change is needed."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('Approved recruiter goes to the dashboard with the full profile', () => {",
+              "  pm.response.to.have.status(200);",
+              "  pm.expect(json.registered).to.eql(true);",
+              "  pm.expect(json.nextStep).to.eql('RECRUITER_DASHBOARD');",
+              "  pm.expect(json.user.accountStatus).to.eql('ACTIVE');",
+              "  pm.expect(json.user.accountType).to.eql('RECRUITER');",
+              "  pm.expect(json.user.userId).to.eql(json.user.recruiterId);",
+              "  pm.expect(json.user.phoneVerified).to.eql(false);",
+              "  pm.expect(json.user.email).to.be.a('string');",
+              "  const id = pm.collectionVariables.get('registeredRecruiterId');",
+              "  if (id) pm.expect(String(json.user.userId)).to.eql(String(id));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Suspended recruiter lookup (after setting SUSPENDED in MySQL)",
+      "request": {
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me",
+        "description": "Run ONLY after: UPDATE users SET account_status = 'SUSPENDED' WHERE user_id = <id>; (manual, MySQL)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('403 ACCOUNT_SUSPENDED, no nextStep', () => {",
+              "  pm.response.to.have.status(403);",
+              "  const json = pm.response.json();",
+              "  pm.expect(json.success).to.eql(false);",
+              "  pm.expect(json.code).to.eql('ACCOUNT_SUSPENDED');",
+              "  pm.expect(json.message).to.eql('Your recruiter account has been suspended.');",
+              "  pm.expect(json.nextStep).to.be.undefined;",
+              "  pm.expect(json.requestId).to.be.a('string');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Existing student identity (ACCOUNT_TYPE_MISMATCH)",
+      "request": {
+        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{COGNITO_ACCESS_TOKEN_STUDENT}}", "type": "string" }] },
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me",
+        "description": "Needs COGNITO_ACCESS_TOKEN_STUDENT: a token of a Google account already registered as a student. It must not be converted into a recruiter."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.variables.get('COGNITO_ACCESS_TOKEN_STUDENT')) {",
+              "  pm.test.skip('Set COGNITO_ACCESS_TOKEN_STUDENT to run this request');",
+              "} else {",
+              "  pm.test('403 ACCOUNT_TYPE_MISMATCH', () => {",
+              "    pm.response.to.have.status(403);",
+              "    pm.expect(pm.response.json().code).to.eql('ACCOUNT_TYPE_MISMATCH');",
+              "    pm.expect(pm.response.json().message).to.eql('This Google account is already associated with another HireMeBot account type.');",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. Duplicate registration (409, nothing created)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{BASE_URL}}/api/v1/recruiters/register",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"firstName\":\"Alex\",\"lastName\":\"Smith\",\"phoneNumber\":\"+17135550101\",\"acceptedTerms\":true}"
+        },
+        "description": "Register again with the same Google account (pending, active or suspended)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('409 ACCOUNT_ALREADY_REGISTERED (or ACCOUNT_SUSPENDED if you suspended it) with a requestId', () => {",
+              "  const json = pm.response.json();",
+              "  pm.expect([409, 403]).to.include(pm.response.code);",
+              "  pm.expect(['ACCOUNT_ALREADY_REGISTERED', 'ACCOUNT_SUSPENDED']).to.include(json.code);",
+              "  pm.expect(json.requestId).to.be.a('string');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. Invalid token",
+      "request": {
+        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "eyJraWQiOiJmYWtlIiwiYWxnIjoiUlMyNTYifQ.eyJzdWIiOiJ4IiwidG9rZW5fdXNlIjoiYWNjZXNzIn0.c2ln", "type": "string" }] },
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me?email=someone@example.com&userId=1",
+        "description": "A forged token. The email and userId query parameters cannot supply an identity."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('401 (API Gateway {message:Unauthorized} or backend UNAUTHORIZED)', () => {",
+              "  pm.response.to.have.status(401);",
+              "  const json = pm.response.json();",
+              "  pm.expect(json.code === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "9. Missing token",
+      "request": {
+        "auth": { "type": "noauth" },
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('401 (API Gateway {message:Unauthorized} or backend UNAUTHORIZED)', () => {",
+              "  pm.response.to.have.status(401);",
+              "  const json = pm.response.json();",
+              "  pm.expect(json.code === 'UNAUTHORIZED' || json.message === 'Unauthorized').to.eql(true);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Unverified Google email",
+      "request": {
+        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{COGNITO_ACCESS_TOKEN_UNVERIFIED}}", "type": "string" }] },
+        "method": "GET",
+        "url": "{{BASE_URL}}/api/v1/recruiters/auth/me",
+        "description": "Needs COGNITO_ACCESS_TOKEN_UNVERIFIED: a token whose Google email is not verified in Cognito."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.variables.get('COGNITO_ACCESS_TOKEN_UNVERIFIED')) {",
+              "  pm.test.skip('Set COGNITO_ACCESS_TOKEN_UNVERIFIED to run this request');",
+              "} else {",
+              "  pm.test('403 EMAIL_NOT_VERIFIED', () => {",
+              "    pm.response.to.have.status(403);",
+              "    pm.expect(pm.response.json().code).to.eql('EMAIL_NOT_VERIFIED');",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Extra: registration validation error (400)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{BASE_URL}}/api/v1/recruiters/register",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"firstName\":\"\",\"lastName\":\"Smith\",\"phoneNumber\":\"7135550101\",\"acceptedTerms\":false,\"accountStatus\":\"ACTIVE\",\"email\":\"intruder@example.com\"}"
+        },
+        "description": "Invalid fields; the forged accountStatus and email are ignored (and the request never reaches the database)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400 VALIDATION_FAILED with field errors (needs a valid token; 401 otherwise)', () => {",
+              "  pm.response.to.have.status(400);",
+              "  const json = pm.response.json();",
+              "  pm.expect(json.code).to.eql('VALIDATION_FAILED');",
+              "  pm.expect(json.fieldErrors.map(e => e.field)).to.include.members(['firstName', 'phoneNumber', 'acceptedTerms']);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Extra: wrong content type (415)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "text/plain" }],
+        "url": "{{BASE_URL}}/api/v1/recruiters/register",
+        "body": { "mode": "raw", "raw": "firstName=Alex" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('415 UNSUPPORTED_MEDIA_TYPE (needs a valid token; 401 otherwise)', () => {",
+              "  pm.response.to.have.status(415);",
+              "  pm.expect(pm.response.json().code).to.eql('UNSUPPORTED_MEDIA_TYPE');",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "registeredRecruiterId", "value": "" }
+  ]
+}

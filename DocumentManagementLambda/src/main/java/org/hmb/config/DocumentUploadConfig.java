@@ -22,8 +22,6 @@ import java.util.Optional;
  * DOCUMENT_RESUME_MAX_SIZE_MB         (default 5, 1..50)
  * DOCUMENT_COVER_LETTER_ENABLED       (default false: defined but not enabled in V1)
  * DOCUMENT_COVER_LETTER_MAX_SIZE_MB   (default 5, 1..50)
- * RECONCILE_LOOKBACK_DAYS             (default 5, 1..6; must stay below the 7-day pending-object expiry)
- * RECONCILE_BATCH_SIZE                (default 500, 1..1000)
  * </pre>
  * Invalid values fail fast with an {@link IllegalStateException} whose message names the variable but never a value.
  */
@@ -49,18 +47,13 @@ public final class DocumentUploadConfig {
     private final int urlExpirySeconds;
     private final int tokenTtlSeconds;
     private final Map<DocumentType, TypePolicy> policies;
-    private final int reconcileLookbackDays;
-    private final int reconcileBatchSize;
 
     private DocumentUploadConfig(String bucket, int urlExpirySeconds, int tokenTtlSeconds,
-                                 Map<DocumentType, TypePolicy> policies, int reconcileLookbackDays,
-                                 int reconcileBatchSize) {
+                                 Map<DocumentType, TypePolicy> policies) {
         this.bucket = bucket;
         this.urlExpirySeconds = urlExpirySeconds;
         this.tokenTtlSeconds = tokenTtlSeconds;
         this.policies = policies;
-        this.reconcileLookbackDays = reconcileLookbackDays;
-        this.reconcileBatchSize = reconcileBatchSize;
     }
 
     public static DocumentUploadConfig fromEnv(Map<String, String> env) {
@@ -71,9 +64,7 @@ public final class DocumentUploadConfig {
                 blankToNull(env.get(BUCKET_VAR)),
                 intVar(env, "UPLOAD_URL_EXPIRY_SECONDS", 300, 1, 3600),
                 intVar(env, "UPLOAD_TOKEN_TTL_SECONDS", 1800, 60, 86_400),
-                policies,
-                intVar(env, "RECONCILE_LOOKBACK_DAYS", 5, 1, 6),
-                intVar(env, "RECONCILE_BATCH_SIZE", 500, 1, 1000));
+                policies);
     }
 
     private static TypePolicy policy(Map<String, String> env, DocumentType type, String prefix, boolean enabledByDefault) {
@@ -100,14 +91,6 @@ public final class DocumentUploadConfig {
 
     public TypePolicy policy(DocumentType type) {
         return policies.get(type);
-    }
-
-    public int reconcileLookbackDays() {
-        return reconcileLookbackDays;
-    }
-
-    public int reconcileBatchSize() {
-        return reconcileBatchSize;
     }
 
     private static String blankToNull(String value) {

@@ -11,16 +11,21 @@ import java.sql.SQLException;
  */
 public class RecruiterAccessRepository {
 
-    /** The recruiter role: an existing recruiter whose user is not soft-deleted. Student and manager ids fail it. */
+    /**
+     * The recruiter role: an existing recruiter whose user is not soft-deleted and has been approved
+     * ({@code account_status = 'ACTIVE'}; new recruiters are {@code PENDING} until the operator approves them in MySQL).
+     * Student and manager ids fail it, and so do pending and suspended recruiters.
+     */
     private static final String ACTIVE_RECRUITER_SQL = """
             SELECT r.recruiter_id
             FROM recruiters r
             JOIN users u ON u.user_id = r.recruiter_id
             WHERE r.recruiter_id = ?
               AND u.is_deleted = FALSE
+              AND u.account_status = 'ACTIVE'
             """;
 
-    /** The recruiter is assigned to the student, and neither user is soft-deleted. */
+    /** The recruiter (approved, {@code ACTIVE}) is assigned to the student, and neither user is soft-deleted. */
     private static final String ACTIVE_ASSIGNMENT_SQL = """
             SELECT 1
             FROM recruiter_student_assignments rsa
@@ -31,6 +36,7 @@ public class RecruiterAccessRepository {
             WHERE rsa.recruiter_id = ?
               AND rsa.student_id = ?
               AND ru.is_deleted = FALSE
+              AND ru.account_status = 'ACTIVE'
               AND su.is_deleted = FALSE
             """;
 

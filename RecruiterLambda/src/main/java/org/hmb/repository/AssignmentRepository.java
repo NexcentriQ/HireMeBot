@@ -13,6 +13,7 @@ import java.util.List;
 /** Reads recruiter-student assignments. Stateless; the caller owns the connection and transaction. */
 public class AssignmentRepository {
 
+    /** The recruiter must be approved ({@code ACTIVE}): a pending or suspended recruiter has no usable assignment. */
     private static final String ACTIVE_ASSIGNMENT_SQL = """
             SELECT 1
             FROM recruiter_student_assignments rsa
@@ -23,6 +24,7 @@ public class AssignmentRepository {
             WHERE rsa.recruiter_id = ?
               AND rsa.student_id = ?
               AND ru.is_deleted = FALSE
+              AND ru.account_status = 'ACTIVE'
               AND su.is_deleted = FALSE
             """;
 
@@ -49,7 +51,8 @@ public class AssignmentRepository {
             """;
 
     /**
-     * @return true if the recruiter is assigned to the student and neither user is soft-deleted
+     * @return true if the recruiter is assigned to the student, neither user is soft-deleted and the recruiter has been
+     * approved ({@code account_status = 'ACTIVE'})
      */
     public boolean isActiveAssignment(Connection connection, long recruiterId, long studentId) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(ACTIVE_ASSIGNMENT_SQL)) {

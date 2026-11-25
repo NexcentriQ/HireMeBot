@@ -8,16 +8,21 @@ activity. The frontend caches the whole response and navigates pages itself.
 There is **no `date` parameter and no pagination parameters**. The backend always reports the current date in the
 reporting zone and returns every page at once.
 
-> **Security status: development only.** The student is identified by the `X-Dev-Student-Id` header. That is
-> **not authentication**. The header is honoured only when `ALLOW_DEV_STUDENT_HEADER=true` (set in your local
-> `env.json`, `false` in the template, so a deployed stack answers 403). Do not expose this API publicly until
-> Cognito/JWT replaces it.
+> **Authentication.** The student is identified **only** by the verified Cognito access token. API Gateway's
+> `CognitoAccessToken` authorizer (scope `openid`) is the first gate; the Lambda then verifies the token itself with the
+> shared `JwtAccessTokenVerifier` (so `sam local`, where authorizers do not run, is protected too) and maps the `sub`
+> through `user_identities`, `users` and `students` to an account that must be `ACTIVE`, not soft-deleted, a student and a
+> Google identity (otherwise `403`). A student can therefore only read their own applications. The
+> `X-Dev-Student-Id` header is a **local-only** fallback (`ALLOW_DEV_STUDENT_HEADER=true` **and** `sam local`, only when no
+> `Authorization` header is sent); a bad token never falls back to it.
 
 ## Layout
 
 ```
 org.hmb
-├── handler/StudentLambdaHandler            route + method, dev header, deprecated-param rejection, JSON out
+├── handler/StudentLambdaHandler            route + method, authentication, deprecated-param rejection, JSON out
+├── repository/StudentIdentityRepository   reads user_identities + users + students for a verified Cognito sub (status, deleted, role)
+├── security/StudentAuthenticator           token -> ACTIVE student id (dev header only under sam local)
 ├── service/StudentApplicationService       resolves "today", loads profile + today's apps, paginates, attaches statistics
 ├── service/StudentStatisticsService        reporting periods, weekday targets, percentages, Mon-Fri activity
 ├── repository/StudentRepository            ONE query: validates the student (exists, not soft-deleted) and loads the profile
@@ -84,7 +89,7 @@ student id, so another student's profile can never be returned. Only five column
 | | |
 |---|---|
 | Method / path | `GET /api/v1/student/applications` |
-| Header | `X-Dev-Student-Id: <positive student user_id>` (case-insensitive name) |
+| Header | `Authorization: Bearer <Cognito access token>` (the student is resolved only from the verified token; any student id sent by the client is ignored) |
 | Query | none. `date`, `startDate`, `endDate`, `month`, `week`, `page`, `size` are rejected with 400 |
 
 ## Response (`200`)
@@ -138,8 +143,9 @@ fewer); keys are strings `"1"`, `"2"`, ... With no applications today: `totalApp
 | Status | When |
 |---|---|
 | 200 | success, including a student with no applications today |
-| 400 | missing or non-positive `X-Dev-Student-Id`; any deprecated query parameter present |
-| 403 | `ALLOW_DEV_STUDENT_HEADER` is not `true` |
+| 400 | a deprecated query parameter present; under `sam local` only: missing or non-positive `X-Dev-Student-Id` |
+| 401 | no, malformed, invalid, expired, ID, foreign-pool or wrong-client token |
+| 403 | valid token, but the account is not an `ACTIVE`, non-deleted student (PENDING, SUSPENDED, deleted, recruiter/manager, no account, not a Google identity) |
 | 404 | student does not exist or is soft-deleted; unknown path |
 | 405 | method other than GET (sends `Allow: GET`) |
 | 503 | database unreachable or pool timeout |
@@ -152,28 +158,43 @@ fewer); keys are strings `"1"`, `"2"`, ... With no applications today: `totalApp
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, `DB_SSL_MODE` | database, as for RecruiterLambda |
 | `APP_TIMEZONE` | reporting zone, default `America/Chicago` |
 | `DAILY_APPLICATION_TARGET` | per-weekday target, default `50` |
-| `ALLOW_DEV_STUDENT_HEADER` | must be `true` to accept `X-Dev-Student-Id` |
+| `COGNITO_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID` | the user pool and app client the access token must come from (the template sets them; a bad value fails closed) |
+| `ALLOW_DEV_STUDENT_HEADER` | `true` only in the git-ignored local `env.json`: allows `X-Dev-Student-Id` when the request has no `Authorization` header **and** the process runs under `sam local` (`AWS_SAM_LOCAL`). Ignored in a deployed stack |
 
 ## Run locally
 
 Requires JDK 21, Maven, Docker (running) and the SAM CLI.
 
 ```bash
-mvn clean test                              # unit tests; the database tests are skipped
+mvn clean test                              # unit tests; the database tests are skipped (see below)
 mvn clean install -DskipTests               # puts the parent pom and `common` where sam build can find them
 sam build
 sam local start-api --env-vars env.json     # serves both Lambdas on http://127.0.0.1:3000
 ```
 
+### Database tests
+
+`StudentTokenAuthIntegrationTest` (ACTIVE, PENDING, SUSPENDED, deleted, recruiter/manager, invalid token, cross-student)
+runs the real handler, authenticator, services and SQL against MySQL. Set `RUN_DB_TESTS=true` and `DB_HOST`, `DB_PORT`,
+`DB_USERNAME`, `DB_PASSWORD`, `DB_SSL_MODE`; the account needs CREATE and DROP. The test creates its own throwaway schema
+`hmb_stu_it_<random>` from `hiremebot_db_V1.sql` and drops it afterwards, ignoring `DB_NAME`, so no existing database or
+record is touched. (`StudentApplicationFlowIntegrationTest` is older: it writes to the database named by `DB_NAME`, so point
+`DB_NAME` at a scratch copy, never at real data.)
 ### Postman
 
 - `GET http://localhost:3000/api/v1/student/applications`
-- Header: `X-Dev-Student-Id: 1000000002`
+- Deployed: Authorization tab, type Bearer Token, the student's Cognito **access** token (not the ID token).
+- `sam local` only: no Authorization header, plus `X-Dev-Student-Id: 1000000002` (needs `ALLOW_DEV_STUDENT_HEADER=true`).
 - No query parameters.
+- The ready-made requests are in `postman/StudentDashboard.postman_collection.json`.
 
 ### curl
 
 ```bash
+curl -i "https://<api-id>.execute-api.us-east-2.amazonaws.com/api/v1/student/applications" \
+  -H "Authorization: Bearer $COGNITO_ACCESS_TOKEN"
+
+# under sam local only (no token, ALLOW_DEV_STUDENT_HEADER=true in env.json)
 curl -i "http://localhost:3000/api/v1/student/applications" -H "X-Dev-Student-Id: 1000000002"
 ```
 
@@ -226,7 +247,7 @@ WHERE student_id = 1000000002
 
 ```bash
 mvn test                     # unit tests (StudentLambda: 100)
-# Integration tests need a MySQL with hiremebot_db_V1 loaded. Run from the host with 127.0.0.1.
+# Integration tests need a MySQL with hiremebot_db_v1 loaded. Run from the host with 127.0.0.1.
 # MySQL 8 caching_sha2 over a non-TLS connection may need DB_SSL_MODE=REQUIRED (or allow public key retrieval).
 RUN_DB_TESTS=true DB_HOST=127.0.0.1 DB_PORT=3306 DB_NAME=... DB_USERNAME=... DB_PASSWORD=... DB_SSL_MODE=REQUIRED \
   mvn -pl StudentLambda test -Dtest=StudentApplicationFlowIntegrationTest
