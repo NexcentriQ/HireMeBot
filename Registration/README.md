@@ -558,7 +558,7 @@ Nothing has been deployed. Account 716397954339 / us-east-2 had no stack, Lambda
 
 - **Lambda `RegistrationFunction`:** java21, 1024 MB, 20 s, log group with 30-day retention. IAM:
   - `cognito-idp:AdminGetUser` on the pool;
-  - `secretsmanager:GetSecretValue` on `RegistrationDbSecretArn`;
+  - `secretsmanager:GetSecretValue` on `DatabaseSecretArn`;
   - `kms:Decrypt` if the secret uses a customer-managed key.
 - **HTTP API routes:** `GET /api/v1/auth/me`, `POST /api/v1/students/register`, `GET /api/v1/recruiters/auth/me` and
   `POST /api/v1/recruiters/register`, all with the `CognitoAccessToken` JWT authorizer (issuer
@@ -568,7 +568,7 @@ Nothing has been deployed. Account 716397954339 / us-east-2 had no stack, Lambda
 - **Parameters:**
   - `TermsVersion` (required; the real version);
   - `PhoneVerificationRequired` (default `false`);
-  - `RegistrationDbSecretArn` (required for deployed stacks);
+  - `DatabaseSecretArn` (required for deployed stacks);
   - `PortalOrigin` (the real frontend origin).
 - **Network:** if MySQL is private, put the function in a VPC with a NAT route. The Cognito hosted domain
   (`/oauth2/userInfo`) and the JWKS URL are public endpoints. `cognito-idp` and `secretsmanager` can use NAT or
@@ -577,7 +577,7 @@ Nothing has been deployed. Account 716397954339 / us-east-2 had no stack, Lambda
 
 ```bash
 mvn -pl common -am install -DskipTests && sam build
-sam deploy --parameter-overrides TermsVersion=<version> RegistrationDbSecretArn=<arn> PortalOrigin=<origin>
+sam deploy --parameter-overrides TermsVersion=<version> DatabaseSecretArn=<arn> PortalOrigin=<origin>
 # outputs: AccountLookupUrl, StudentRegistrationUrl, RecruiterAccountLookupUrl, RecruiterRegistrationUrl
 ```
 

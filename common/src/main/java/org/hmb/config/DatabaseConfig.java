@@ -14,7 +14,8 @@ import javax.sql.DataSource;
 /**
  * Builds the HikariCP pool from environment variables.
  *
- * <p>Required: {@code DB_HOST}, {@code DB_NAME}, {@code DB_USERNAME}, {@code DB_PASSWORD}.
+ * <p>Required: {@code DB_HOST}, {@code DB_NAME}, {@code DB_USERNAME}, {@code DB_PASSWORD}. When {@code DB_SECRET_ARN}
+ * is set, the credentials are read from Secrets Manager first (see {@link DatabaseSecretResolver}).
  * Optional: {@code DB_PORT} (default 3306), {@code DB_SSL_MODE} (default {@code VERIFY_IDENTITY}),
  * {@code DB_TRUSTSTORE_URL}, {@code DB_TRUSTSTORE_PASSWORD}, {@code DB_TRUSTSTORE_TYPE} (default PKCS12) for
  * providers (e.g. Aiven) whose server certificate is signed by a private CA.
@@ -38,7 +39,7 @@ public final class DatabaseConfig {
             synchronized (DatabaseConfig.class) {
                 local = dataSource;
                 if (local == null) {
-                    local = create(System.getenv());
+                    local = create(DatabaseSecretResolver.resolve(System.getenv()));
                     dataSource = local;
                 }
             }
@@ -47,8 +48,8 @@ public final class DatabaseConfig {
     }
 
     /**
-     * Builds a new pool from the given environment map. Public so a module that resolves credentials elsewhere (the
-     * Registration Lambda reads them from Secrets Manager) can pass a resolved map; it owns and caches the result.
+     * Builds a new pool from the given environment map, which must already hold resolved credentials (see
+     * {@link DatabaseSecretResolver#resolve(Map)}). The caller owns and caches the result.
      */
     public static HikariDataSource create(Map<String, String> env) {
         String host = required(env, "DB_HOST");

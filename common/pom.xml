@@ -43,6 +43,37 @@
             <artifactId>nimbus-jose-jwt</artifactId>
             <optional>true</optional>
         </dependency>
+        <!-- DatabaseSecretResolver (DB credentials from Secrets Manager). Optional, like nimbus above: every Lambda module
+             declares these itself, so the common jar never forces SDK versions or HTTP clients on a module. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>secretsmanager</artifactId>
+            <optional>true</optional>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache5-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>netty-nio-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+            <optional>true</optional>
+        </dependency>
 
         <dependency>
             <groupId>org.junit.jupiter</groupId>

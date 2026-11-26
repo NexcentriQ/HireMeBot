@@ -57,16 +57,17 @@ Parameters:
       (RDS), so the name must match the one the schema was created with, character for character; lower case is enforced
       to keep every environment identical. Pass a different name per environment (for example hiremebot_db_v1_staging)
       with --parameter-overrides DatabaseName=...; sam local takes DB_NAME from env.json instead.
-  RegistrationDbSecretArn:
+  DatabaseSecretArn:
     Type: String
     Default: ""
     AllowedPattern: '^$|^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
     Description: >
-      Secrets Manager secret with the database credentials (JSON: username, password, optional host/port/dbname).
-      Required for any deployed stack; leave empty only for sam local, where env.json supplies DB_USERNAME/DB_PASSWORD.
+      Secrets Manager secret with the database credentials (JSON: username, password, optional host/port/dbname), shared
+      by all four functions (DB_SECRET_ARN). Required for any deployed stack; leave empty only for sam local, where
+      env.json supplies DB_USERNAME/DB_PASSWORD.
 
 Conditions:
-  HasRegistrationDbSecret: !Not [!Equals [!Ref RegistrationDbSecretArn, ""]]
+  HasDatabaseSecret: !Not [!Equals [!Ref DatabaseSecretArn, ""]]
 
 Globals:
   Function:
@@ -148,6 +149,17 @@ Resources:
           # `sam local` (AWS_SAM_LOCAL) and only when the request carries no Authorization header, so a deployed stack
           # ignores it whatever this says, and a Bearer token always wins.
           ALLOW_DEV_RECRUITER_HEADER: "false"
+          DB_SECRET_ARN: !Ref DatabaseSecretArn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - !If
+              - HasDatabaseSecret
+              - Sid: ReadDatabaseCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecretArn
+              - !Ref AWS::NoValue
       Events:
         CreateApplication:
           Type: HttpApi
@@ -167,6 +179,12 @@ Resources:
               Authorizer: CognitoAccessToken
               AuthorizationScopes:
                 - openid
+
+  RecruiterFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${RecruiterFunction}"
+      RetentionInDays: 30
 
   StudentFunction:
     Type: AWS::Serverless::Function
@@ -203,6 +221,17 @@ Resources:
           # `sam local` (AWS_SAM_LOCAL) and only when the request carries no Authorization header, so a deployed stack
           # ignores it whatever this says, and a Bearer token always wins.
           ALLOW_DEV_STUDENT_HEADER: "false"
+          DB_SECRET_ARN: !Ref DatabaseSecretArn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - !If
+              - HasDatabaseSecret
+              - Sid: ReadDatabaseCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecretArn
+              - !Ref AWS::NoValue
       Events:
         ListApplications:
           Type: HttpApi
@@ -213,6 +242,12 @@ Resources:
               Authorizer: CognitoAccessToken
               AuthorizationScopes:
                 - openid
+
+  StudentFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StudentFunction}"
+      RetentionInDays: 30
 
   # ---- Document upload (resumes) -------------------------------------------------------------------------------
   # Browser -> presigned PUT -> this private bucket. Nothing here is public; the bucket never serves a GET.
@@ -315,6 +350,7 @@ Resources:
           # `sam local` (AWS_SAM_LOCAL) and only when the request carries no Authorization header, so a deployed stack
           # ignores it whatever this says, and a Bearer token always wins.
           ALLOW_DEV_RECRUITER_HEADER: "false"
+          DB_SECRET_ARN: !Ref DatabaseSecretArn
           DOCUMENTS_BUCKET: !Ref DocumentsBucket
           UPLOAD_SIGNING_SECRET_ID: !Ref UploadSigningSecret
           # Local only (honoured only under `sam local`): signs tokens when no Secrets Manager secret is used.
@@ -352,6 +388,13 @@ Resources:
               Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref UploadSigningSecret
+            - !If
+              - HasDatabaseSecret
+              - Sid: ReadDatabaseCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecretArn
+              - !Ref AWS::NoValue
             # Deliberately absent: s3:DeleteObject. Nothing in V1 deletes objects (no lifecycle rule either).
       Events:
         RequestUploadUrl:
@@ -372,6 +415,12 @@ Resources:
               Authorizer: CognitoAccessToken
               AuthorizationScopes:
                 - openid
+
+  DocumentManagementFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DocumentManagementFunction}"
+      RetentionInDays: 30
 
   # ---- Student and recruiter sign-in and registration -----------------------------------------------------------
   # The "Registration" Lambda (Maven module Registration/) serves the unified "Continue with Google" flow of both
@@ -411,7 +460,7 @@ Resources:
           DB_TRUSTSTORE_URL: ""
           DB_TRUSTSTORE_PASSWORD: ""
           DB_TRUSTSTORE_TYPE: PKCS12
-          DB_SECRET_ARN: !Ref RegistrationDbSecretArn
+          DB_SECRET_ARN: !Ref DatabaseSecretArn
           COGNITO_REGION: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
           COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
           COGNITO_CLIENT_ID: !Ref CognitoAppClientId
@@ -430,11 +479,11 @@ Resources:
                 - "arn:${AWS::Partition}:cognito-idp:${PoolRegion}:${AWS::AccountId}:userpool/${CognitoUserPoolId}"
                 - PoolRegion: !Select [0, !Split ["_", !Ref CognitoUserPoolId]]
             - !If
-              - HasRegistrationDbSecret
+              - HasDatabaseSecret
               - Sid: ReadDatabaseCredentials
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Ref RegistrationDbSecretArn
+                Resource: !Ref DatabaseSecretArn
               - !Ref AWS::NoValue
       Events:
         AccountLookup:

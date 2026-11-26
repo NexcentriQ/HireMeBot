@@ -713,7 +713,7 @@ Risk: none for classic JDBC; verify with the MySQL ITs.
 | `CognitoDomain` | Real dev hosted domain | Same |
 | `TermsVersion` | **None (must be supplied)** | Owner supplies the published terms version |
 | `PhoneVerificationRequired` | `"false"` | Keep `false` for V1 (no SMS verification exists) |
-| `RegistrationDbSecretArn` | `""` | Must be the DB secret ARN in any AWS environment |
+| `DatabaseSecretArn` | `""` | Must be the DB secret ARN in any AWS environment |
 | **Missing:** `Environment`/`Stage` | - | Add; use in resource names, tags, and `samconfig.toml` environments |
 | **Missing:** DB host/port/name/SSL parameters and secret ARNs for Recruiter, Student, Document | - | Add after INF-02 |
 | **Missing:** `VpcSubnetIds`, `LambdaSecurityGroupId` | - | Add after INF-01 |
@@ -828,7 +828,7 @@ gap, **DD** documentation discrepancy, **PR** potential risk requiring verificat
 - [ ] VPC config, security groups, NAT (Cognito JWKS/userInfo), S3 gateway endpoint (INF-01).
 - [ ] DB credentials in Secrets Manager for every function; no plaintext passwords in Lambda configuration (INF-02).
 - [ ] TLS to MySQL verified (INF-04).
-- [ ] `TermsVersion`, `RegistrationDbSecretArn`, Cognito parameters and `PortalOrigin` passed explicitly.
+- [ ] `TermsVersion`, `DatabaseSecretArn`, Cognito parameters and `PortalOrigin` passed explicitly.
 - [ ] `sam validate --lint` and `mvn clean verify` (scratch schema) green.
 
 ### Before staging deployment
